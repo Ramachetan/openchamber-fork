@@ -4,6 +4,8 @@ import { getThemeKindName } from './theme';
 import type { OpenCodeManager, ConnectionStatus } from './opencode';
 import { getWebviewShikiThemes } from './shikiThemes';
 import { getWebviewHtml } from './webviewHtml';
+import type { UnifiedBackendManager } from './backends/backendManager';
+import type { OpenCodeAdapter } from './backends/adapters/opencodeAdapter';
 
 type SessionPanelState = {
   panel: vscode.WebviewPanel;
@@ -18,12 +20,19 @@ export class SessionEditorPanelProvider {
   private _cachedError?: string;
   private _sseCounter = 0;
   private _panels = new Map<string, SessionPanelState>();
+  private _openCodeManager?: OpenCodeManager;
 
   constructor(
     private readonly _context: vscode.ExtensionContext,
     private readonly _extensionUri: vscode.Uri,
-    private readonly _openCodeManager?: OpenCodeManager
-  ) {}
+    private readonly _backendManager?: UnifiedBackendManager
+  ) {
+    // Extract OpenCodeManager from backend if using OpenCode
+    if (_backendManager?.getBackendType() === 'opencode') {
+      const backend = _backendManager.getActiveBackend() as OpenCodeAdapter;
+      this._openCodeManager = backend?.getOpenCodeManager?.();
+    }
+  }
 
   public createOrShowNewSession(): void {
     // Generate unique panel ID for new session drafts

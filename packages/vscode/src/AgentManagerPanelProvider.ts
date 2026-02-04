@@ -4,12 +4,15 @@ import { getThemeKindName } from './theme';
 import type { OpenCodeManager, ConnectionStatus } from './opencode';
 import { getWebviewShikiThemes } from './shikiThemes';
 import { getWebviewHtml } from './webviewHtml';
+import type { UnifiedBackendManager } from './backends/backendManager';
+import type { OpenCodeAdapter } from './backends/adapters/opencodeAdapter';
 
 export class AgentManagerPanelProvider {
   public static readonly viewType = 'openchamber.agentManager';
 
   private _panel?: vscode.WebviewPanel;
-  
+  private _openCodeManager?: OpenCodeManager;
+
   // Cache latest status/URL for when webview is resolved after connection is ready
   private _cachedStatus: ConnectionStatus = 'connecting';
   private _cachedError?: string;
@@ -20,8 +23,14 @@ export class AgentManagerPanelProvider {
   constructor(
     private readonly _context: vscode.ExtensionContext,
     private readonly _extensionUri: vscode.Uri,
-    private readonly _openCodeManager?: OpenCodeManager
-  ) {}
+    private readonly _backendManager?: UnifiedBackendManager
+  ) {
+    // Extract OpenCodeManager from backend if using OpenCode
+    if (_backendManager?.getBackendType() === 'opencode') {
+      const backend = _backendManager.getActiveBackend() as OpenCodeAdapter;
+      this._openCodeManager = backend?.getOpenCodeManager?.();
+    }
+  }
 
   public createOrShow(): void {
     // If panel exists, reveal it

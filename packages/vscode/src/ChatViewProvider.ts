@@ -4,11 +4,14 @@ import { getThemeKindName } from './theme';
 import type { OpenCodeManager, ConnectionStatus } from './opencode';
 import { getWebviewShikiThemes } from './shikiThemes';
 import { getWebviewHtml } from './webviewHtml';
+import type { UnifiedBackendManager } from './backends/backendManager';
+import type { OpenCodeAdapter } from './backends/adapters/opencodeAdapter';
 
 export class ChatViewProvider implements vscode.WebviewViewProvider {
   public static readonly viewType = 'neusis-code.chatView';
 
   private _view?: vscode.WebviewView;
+  private _openCodeManager?: OpenCodeManager;
 
   public isVisible() {
     return this._view?.visible ?? false;
@@ -24,8 +27,14 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   constructor(
     private readonly _context: vscode.ExtensionContext,
     private readonly _extensionUri: vscode.Uri,
-    private readonly _openCodeManager?: OpenCodeManager
-  ) {}
+    private readonly _backendManager?: UnifiedBackendManager
+  ) {
+    // Extract OpenCodeManager from backend if using OpenCode
+    if (_backendManager?.getBackendType() === 'opencode') {
+      const backend = _backendManager.getActiveBackend() as OpenCodeAdapter;
+      this._openCodeManager = backend?.getOpenCodeManager?.();
+    }
+  }
 
   public resolveWebviewView(
     webviewView: vscode.WebviewView

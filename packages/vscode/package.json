@@ -193,10 +193,36 @@
     "configuration": {
       "title": "Neusis Code",
       "properties": {
+        "neusis-code.backend": {
+          "type": "string",
+          "enum": ["auto", "opencode", "claude-cli"],
+          "default": "auto",
+          "description": "Backend selection: 'auto' for auto-detection, 'opencode' for OpenCode API, 'claude-cli' for Claude CLI"
+        },
         "neusis-code.apiUrl": {
           "type": "string",
           "default": "",
           "description": "URL of an external OpenCode API server. Leave empty to auto-start a local instance."
+        },
+        "neusis-code.claudeCli.wslEnabled": {
+          "type": "boolean",
+          "default": false,
+          "description": "Enable WSL integration for Claude CLI on Windows"
+        },
+        "neusis-code.claudeCli.wslDistro": {
+          "type": "string",
+          "default": "Ubuntu",
+          "description": "WSL distribution name (e.g., Ubuntu, Debian)"
+        },
+        "neusis-code.claudeCli.wslNodePath": {
+          "type": "string",
+          "default": "/usr/bin/node",
+          "description": "Path to Node.js in the WSL distribution"
+        },
+        "neusis-code.claudeCli.wslClaudePath": {
+          "type": "string",
+          "default": "/usr/local/bin/claude",
+          "description": "Path to Claude executable in the WSL distribution"
         }
       }
     }
@@ -224,7 +250,7 @@
     "vite": "^7.1.2"
   },
   "dependencies": {
-    "@openchamber/ui": "workspace:*",
+    "@openchamber/ui": "file:../ui",
     "@opencode-ai/sdk": "^1.1.48",
     "adm-zip": "^0.5.16",
     "jsonc-parser": "^3.3.1",

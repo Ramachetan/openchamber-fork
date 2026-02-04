@@ -1,0 +1,6 @@
+[submodule "claude-code-chat"]
+	path = claude-code-chat
+	url = https://github.com/andrepimenta/claude-code-chat
+[submodule "opencode"]
+	path = opencode
+	url = https://github.com/anomalyco/opencode
