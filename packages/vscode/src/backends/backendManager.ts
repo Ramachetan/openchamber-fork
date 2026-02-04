@@ -30,6 +30,47 @@ export class UnifiedBackendManager {
     private readonly _outputChannel: vscode.OutputChannel
   ) {}
 
+  private async _sleep(ms: number): Promise<void> {
+    await new Promise((resolve) => setTimeout(resolve, ms));
+  }
+
+  private async _createConnectedAdapter(type: BackendType): Promise<BackendManager> {
+    const maxAttempts = type === 'opencode' ? 2 : 1;
+    let lastError: unknown;
+
+    for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+      const backend = await this._createAdapter(type);
+      try {
+        this._outputChannel.appendLine(
+          `[Backend Manager] Initializing ${type} backend (attempt ${attempt}/${maxAttempts})...`
+        );
+        await backend.initialize();
+        this._outputChannel.appendLine(
+          `[Backend Manager] Connecting to ${type} backend (attempt ${attempt}/${maxAttempts})...`
+        );
+        await backend.connect();
+        return backend;
+      } catch (error) {
+        lastError = error;
+        const errorMessage = error instanceof Error ? error.message : String(error);
+        this._outputChannel.appendLine(
+          `[Backend Manager] ${type} connection attempt ${attempt} failed: ${errorMessage}`
+        );
+        try {
+          await backend.disconnect();
+        } catch {
+          // ignore disconnect errors for failed attempts
+        }
+        backend.dispose();
+        if (attempt < maxAttempts) {
+          await this._sleep(800);
+        }
+      }
+    }
+
+    throw lastError instanceof Error ? lastError : new Error(String(lastError));
+  }
+
   /**
    * Initialize backend with auto-detection
    */
@@ -60,7 +101,7 @@ export class UnifiedBackendManager {
 
       if (this._detectionResult.claudeInfo) {
         this._outputChannel.appendLine(
-          `[Backend Manager] Claude CLI - Available: ${this._detectionResult.claudeInfo.cliAvailable}, Version: ${this._detectionResult.claudeInfo.version || 'N/A'}, WSL: ${this._detectionResult.claudeInfo.wslAvailable || false}`
+          `[Backend Manager] Claude Code - Available: ${this._detectionResult.claudeInfo.cliAvailable}, Version: ${this._detectionResult.claudeInfo.version || 'N/A'}, WSL: ${this._detectionResult.claudeInfo.wslAvailable || false}`
         );
       }
 
@@ -81,20 +122,9 @@ export class UnifiedBackendManager {
         `[Backend Manager] Selected backend: ${selectedBackend}`
       );
 
-      // Step 3: Create adapter
-      this._activeBackend = await this._createAdapter(selectedBackend);
+      // Step 3: Create, initialize, and connect adapter
+      this._activeBackend = await this._createConnectedAdapter(selectedBackend);
       this._backendType = selectedBackend;
-
-      // Step 4: Initialize and connect
-      this._outputChannel.appendLine(
-        `[Backend Manager] Initializing ${selectedBackend} backend...`
-      );
-      await this._activeBackend.initialize();
-
-      this._outputChannel.appendLine(
-        `[Backend Manager] Connecting to ${selectedBackend} backend...`
-      );
-      await this._activeBackend.connect();
 
       this._isInitialized = true;
 
@@ -116,13 +146,13 @@ export class UnifiedBackendManager {
       // Show user-friendly error
       if (this._detectionResult && this._detectionResult.available.length === 0) {
         void vscode.window.showErrorMessage(
-          'No AI backend available. Please install OpenCode CLI or Claude CLI to use Neusis Code.',
+          'No AI backend available. Please install OpenCode CLI or Claude Code CLI to use Neusis Code.',
           'Install OpenCode',
-          'Install Claude'
+          'Install Claude Code'
         ).then((choice) => {
           if (choice === 'Install OpenCode') {
             void vscode.env.openExternal(vscode.Uri.parse('https://www.opencode.ai'));
-          } else if (choice === 'Install Claude') {
+          } else if (choice === 'Install Claude Code') {
             void vscode.env.openExternal(vscode.Uri.parse('https://claude.ai/download'));
           }
         });
@@ -203,25 +233,48 @@ export class UnifiedBackendManager {
    * Switch to a different backend
    */
   async switchBackend(newBackendType: BackendType): Promise<void> {
+    if (this._backendType === newBackendType && this._activeBackend) {
+      this._outputChannel.appendLine(
+        `[Backend Manager] Already using ${newBackendType}, skipping switch`
+      );
+      return;
+    }
+
     this._outputChannel.appendLine(
       `[Backend Manager] Switching to ${newBackendType}...`
     );
 
-    // Disconnect current backend
-    if (this._activeBackend) {
-      this._outputChannel.appendLine('[Backend Manager] Disconnecting current backend...');
-      await this._activeBackend.disconnect();
-      this._activeBackend.dispose();
-      this._activeBackend = null;
+    // Atomic switch: keep current backend alive until replacement is connected.
+    const previousBackend = this._activeBackend;
+    const previousBackendType = this._backendType;
+    let nextBackend: BackendManager | null = null;
+
+    try {
+      nextBackend = await this._createConnectedAdapter(newBackendType);
+    } catch (error) {
+      const errorMessage = error instanceof Error ? error.message : String(error);
+      this._outputChannel.appendLine(
+        `[Backend Manager] Failed to switch to ${newBackendType}, keeping ${previousBackendType || 'current'} backend active: ${errorMessage}`
+      );
+      throw error;
     }
 
-    // Create new backend
-    this._activeBackend = await this._createAdapter(newBackendType);
-    this._backendType = newBackendType;
+    if (previousBackend) {
+      this._outputChannel.appendLine('[Backend Manager] Disconnecting previous backend...');
+      try {
+        await previousBackend.disconnect();
+      } catch (error) {
+        const errorMessage = error instanceof Error ? error.message : String(error);
+        this._outputChannel.appendLine(
+          `[Backend Manager] Previous backend disconnect error: ${errorMessage}`
+        );
+      }
+      previousBackend.dispose();
+    }
 
-    // Initialize and connect
-    await this._activeBackend.initialize();
-    await this._activeBackend.connect();
+    this._activeBackend = nextBackend;
+    this._backendType = newBackendType;
+    this._isInitialized = true;
 
     this._outputChannel.appendLine(
       `[Backend Manager] Successfully switched to ${newBackendType}`

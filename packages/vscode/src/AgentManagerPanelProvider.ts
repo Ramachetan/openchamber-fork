@@ -25,11 +25,21 @@ export class AgentManagerPanelProvider {
     private readonly _extensionUri: vscode.Uri,
     private readonly _backendManager?: UnifiedBackendManager
   ) {
-    // Extract OpenCodeManager from backend if using OpenCode
-    if (_backendManager?.getBackendType() === 'opencode') {
-      const backend = _backendManager.getActiveBackend() as OpenCodeAdapter;
+    this._refreshBackendBinding();
+  }
+
+  public refreshBackend(): void {
+    this._refreshBackendBinding();
+    this._sendCachedState();
+  }
+
+  private _refreshBackendBinding(): void {
+    if (this._backendManager?.getBackendType() === 'opencode') {
+      const backend = this._backendManager.getActiveBackend() as OpenCodeAdapter;
       this._openCodeManager = backend?.getOpenCodeManager?.();
+      return;
     }
+    this._openCodeManager = undefined;
   }
 
   public createOrShow(): void {
@@ -104,6 +114,7 @@ export class AgentManagerPanelProvider {
       const response = await handleBridgeMessage(message, {
         manager: this._openCodeManager,
         context: this._context,
+        backendManager: this._backendManager,
       });
       this._panel?.webview.postMessage(response);
     }, null, this._context.subscriptions);
@@ -139,6 +150,7 @@ export class AgentManagerPanelProvider {
       type: 'connectionStatus',
       status: this._cachedStatus,
       error: this._cachedError,
+      backendType: this._backendManager?.getBackendType() || 'unknown',
     });
   }
 
@@ -352,7 +364,8 @@ export class AgentManagerPanelProvider {
 
   private _getHtmlForWebview(webview: vscode.Webview): string {
     const workspaceFolder = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath || '';
-    const cliAvailable = this._openCodeManager?.isCliAvailable() ?? false;
+    const backendType = this._backendManager?.getBackendType() || 'unknown';
+    const cliAvailable = this._backendManager?.getActiveBackend()?.getDebugInfo().cliAvailable ?? true;
 
     return getWebviewHtml({
       webview,
@@ -360,6 +373,7 @@ export class AgentManagerPanelProvider {
       workspaceFolder,
       initialStatus: this._cachedStatus,
       cliAvailable,
+      backendType,
       panelType: 'agentManager',
     });
   }

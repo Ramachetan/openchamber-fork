@@ -17,6 +17,7 @@ import { getSafeStorage } from "./utils/safeStorage";
 import { useFileStore } from "./fileStore";
 import { useSessionStore } from "./sessionStore";
 import { useContextStore } from "./contextStore";
+import { isVSCodeRuntime } from "@/lib/desktop";
 
 // Helper function to clean up pending user message metadata
 const cleanupPendingUserMessageMeta = (
@@ -84,6 +85,15 @@ const streamDebugEnabled = (): boolean => {
     } catch {
         return false;
     }
+};
+
+const isClaudeCliBackendInVSCode = (): boolean => {
+    if (!isVSCodeRuntime() || typeof window === "undefined") {
+        return false;
+    }
+    return (window as Window & {
+        __VSCODE_CONFIG__?: { backendType?: "opencode" | "claude-cli" | "unknown" };
+    }).__VSCODE_CONFIG__?.backendType === "claude-cli";
 };
 
 const computePartsTextLength = (parts: Part[] | undefined): number => {
@@ -710,6 +720,35 @@ export const useMessageStore = create<MessageStore>()(
                                         console.error("Failed to clear attached files after send", clearError);
                                     }
                                 }
+
+                                if (isClaudeCliBackendInVSCode()) {
+                                    await get().loadMessages(sessionId);
+                                    set((state) => {
+                                        const memoryState = state.sessionMemoryState.get(sessionId) || {
+                                            viewportAnchor: 0,
+                                            isStreaming: false,
+                                            lastAccessedAt: Date.now(),
+                                            backgroundMessageCount: 0,
+                                        };
+                                        const nextMemory = new Map(state.sessionMemoryState);
+                                        nextMemory.set(sessionId, {
+                                            ...memoryState,
+                                            isStreaming: false,
+                                            streamStartTime: undefined,
+                                            streamingCooldownUntil: undefined,
+                                            lastAccessedAt: Date.now(),
+                                        });
+                                        const nextHeaders = new Set(state.pendingAssistantHeaderSessions);
+                                        nextHeaders.delete(sessionId);
+                                        const nextUserMeta = cleanupPendingUserMessageMeta(state.pendingUserMessageMetaBySession, sessionId);
+                                        return {
+                                            sessionMemoryState: nextMemory,
+                                            pendingAssistantHeaderSessions: nextHeaders,
+                                            pendingUserMessageMetaBySession: nextUserMeta,
+                                        };
+                                    });
+                                }
+
                                 set((state) => {
                                     const nextControllers = new Map(state.abortControllers);
                                     nextControllers.delete(sessionId);

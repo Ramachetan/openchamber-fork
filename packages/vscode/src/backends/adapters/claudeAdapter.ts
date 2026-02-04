@@ -58,7 +58,7 @@ export class ClaudeAdapter implements BackendManager {
     const isAvailable = await isCommandAvailable('claude');
 
     if (!isAvailable) {
-      throw new Error('Claude CLI not found. Please install Claude CLI to use this backend.');
+      throw new Error('Claude Code CLI not found. Please install Claude Code to use this backend.');
     }
 
     // Get version

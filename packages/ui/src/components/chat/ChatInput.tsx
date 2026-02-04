@@ -41,6 +41,7 @@ import {
     DropdownMenuTrigger,
 } from '@/components/ui/dropdown-menu';
 import { useThemeSystem } from '@/contexts/useThemeSystem';
+import { useVSCodeBackendType } from '@/hooks/useVSCodeBackendType';
 
 const MAX_VISIBLE_TEXTAREA_LINES = 8;
 const EMPTY_QUEUE: QueuedMessage[] = [];
@@ -53,6 +54,8 @@ interface ChatInputProps {
 const isPrimaryMode = (mode?: string) => mode === 'primary' || mode === 'all' || mode === undefined || mode === null;
 
 export const ChatInput: React.FC<ChatInputProps> = ({ onOpenSettings, scrollToBottom }) => {
+    const vscodeBackendType = useVSCodeBackendType();
+    const isClaudeCliBackend = isVSCodeRuntime() && vscodeBackendType === 'claude-cli';
     const [message, setMessage] = React.useState('');
     const [isDragging, setIsDragging] = React.useState(false);
     const [showFileMention, setShowFileMention] = React.useState(false);
@@ -433,6 +436,13 @@ export const ChatInput: React.FC<ChatInputProps> = ({ onOpenSettings, scrollToBo
             }
 
             if (isSoftNetworkError) {
+                if (isClaudeCliBackend && primaryText) {
+                    setMessage(primaryText);
+                    if (allAttachments.length > 0) {
+                        useFileStore.setState({ attachedFiles: allAttachments });
+                    }
+                    toast.error('Claude Code request failed. Your message was restored, please retry.');
+                }
                 return;
             }
 
@@ -1632,19 +1642,23 @@ export const ChatInput: React.FC<ChatInputProps> = ({ onOpenSettings, scrollToBo
                                         {actionButtons}
                                     </div>
                                 </div>
-                                <ModelControls
-                                    className="hidden"
-                                    mobilePanel={mobileControlsPanel}
-                                    onMobilePanelChange={setMobileControlsPanel}
-                                    onMobilePanelSelection={handleReturnToUnifiedControls}
-                                />
-                                <UnifiedControlsDrawer
-                                    open={mobileControlsOpen}
-                                    onClose={handleCloseMobileControls}
-                                    onOpenAgent={() => handleOpenMobilePanel('agent')}
-                                    onOpenModel={() => handleOpenMobilePanel('model')}
-                                    onOpenEffort={() => handleOpenMobilePanel('variant')}
-                                />
+                                <>
+                                    <ModelControls
+                                        className="hidden"
+                                        mobilePanel={mobileControlsPanel}
+                                        onMobilePanelChange={setMobileControlsPanel}
+                                        onMobilePanelSelection={handleReturnToUnifiedControls}
+                                        hideAgentControls={isClaudeCliBackend}
+                                    />
+                                    <UnifiedControlsDrawer
+                                        open={mobileControlsOpen}
+                                        onClose={handleCloseMobileControls}
+                                        onOpenAgent={() => handleOpenMobilePanel('agent')}
+                                        onOpenModel={() => handleOpenMobilePanel('model')}
+                                        onOpenEffort={() => handleOpenMobilePanel('variant')}
+                                        hideAgentControls={isClaudeCliBackend}
+                                    />
+                                </>
                             </>
                         ) : (
                             <>
@@ -1652,7 +1666,7 @@ export const ChatInput: React.FC<ChatInputProps> = ({ onOpenSettings, scrollToBo
                                     {attachmentsControls}
                                 </div>
                                 <div className={cn('flex items-center flex-1 justify-end', footerGapClass, 'md:gap-x-3')}>
-                                    <ModelControls className={cn('flex-1 min-w-0 justify-end')} />
+                                    <ModelControls className={cn('flex-1 min-w-0 justify-end')} hideAgentControls={isClaudeCliBackend} />
                                     {actionButtons}
                                 </div>
                             </>

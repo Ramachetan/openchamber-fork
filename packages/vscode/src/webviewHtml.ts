@@ -13,6 +13,7 @@ export interface WebviewHtmlOptions {
   panelType?: PanelType;
   initialSessionId?: string;
   viewMode?: 'sidebar' | 'editor';
+  backendType?: 'opencode' | 'claude-cli' | 'unknown';
 }
 
 export function getWebviewHtml(options: WebviewHtmlOptions): string {
@@ -25,6 +26,7 @@ export function getWebviewHtml(options: WebviewHtmlOptions): string {
     panelType = 'chat',
     initialSessionId,
     viewMode = 'sidebar',
+    backendType = 'unknown',
   } = options;
 
   const scriptPath = vscode.Uri.joinPath(extensionUri, 'dist', 'webview', 'assets', 'index.js');
@@ -127,9 +129,25 @@ export function getWebviewHtml(options: WebviewHtmlOptions): string {
       </g>
     </svg>
     <div class="status-text" id="loading-status">
-      ${initialStatus === 'connecting' ? 'Starting OpenCode API…' : initialStatus === 'connected' ? 'Initializing…' : 'Connecting…'}
+      ${
+        initialStatus === 'connecting'
+          ? backendType === 'claude-cli'
+            ? 'Starting Claude Code…'
+            : 'Starting OpenCode API…'
+          : initialStatus === 'connected'
+            ? 'Initializing…'
+            : 'Connecting…'
+      }
     </div>
-    ${!cliAvailable ? `<div class="error-text">OpenCode CLI not found. Please install it first.</div>` : ''}
+    ${
+      !cliAvailable
+        ? `<div class="error-text">${
+            backendType === 'claude-cli'
+              ? 'Claude Code CLI not found. Please install it first.'
+              : 'OpenCode CLI not found. Please install it first.'
+          }</div>`
+        : ''
+    }
   </div>
   
   <div id="root"></div>
@@ -144,6 +162,7 @@ export function getWebviewHtml(options: WebviewHtmlOptions): string {
       cliAvailable: ${cliAvailable},
       panelType: "${panelType}",
       viewMode: "${viewMode}",
+      backendType: "${backendType}",
       initialSessionId: ${initialSessionId ? `"${initialSessionId.replace(/\\/g, '\\\\').replace(/"/g, '\\"')}"` : 'null'},
     };
     window.__OPENCHAMBER_HOME__ = "${workspaceFolder.replace(/\\/g, '\\\\')}";

@@ -1,9 +1,11 @@
 import React from 'react';
 import { cn } from '@/lib/utils';
+import { isVSCodeRuntime } from '@/lib/desktop';
 import { useConfigStore } from '@/stores/useConfigStore';
 import { useSessionStore } from '@/stores/useSessionStore';
 import { useContextStore } from '@/stores/contextStore';
 import { formatEffortLabel, getAgentDisplayName, getModelDisplayName } from './mobileControlsUtils';
+import { useVSCodeBackendType } from '@/hooks/useVSCodeBackendType';
 
 interface StatusChipProps {
     onClick: () => void;
@@ -11,6 +13,8 @@ interface StatusChipProps {
 }
 
 export const StatusChip: React.FC<StatusChipProps> = ({ onClick, className }) => {
+    const vscodeBackendType = useVSCodeBackendType();
+    const hideAgent = isVSCodeRuntime() && vscodeBackendType === 'claude-cli';
     const {
         currentModelId,
         currentVariant,
@@ -31,7 +35,9 @@ export const StatusChip: React.FC<StatusChipProps> = ({ onClick, className }) =>
     const modelLabel = getModelDisplayName(currentProvider, currentModelId);
     const hasEffort = getCurrentModelVariants().length > 0;
     const effortLabel = hasEffort ? formatEffortLabel(currentVariant) : null;
-    const fullLabel = [agentLabel, modelLabel, effortLabel].filter(Boolean).join(' · ');
+    const fullLabel = hideAgent
+        ? [modelLabel, effortLabel].filter(Boolean).join(' · ')
+        : [agentLabel, modelLabel, effortLabel].filter(Boolean).join(' · ');
 
     return (
         <button
@@ -51,8 +57,12 @@ export const StatusChip: React.FC<StatusChipProps> = ({ onClick, className }) =>
             }}
             title={fullLabel}
         >
-            <span className="shrink-0">{agentLabel}</span>
-            <span className="shrink-0 text-muted-foreground mx-0.5">·</span>
+            {!hideAgent && (
+                <>
+                    <span className="shrink-0">{agentLabel}</span>
+                    <span className="shrink-0 text-muted-foreground mx-0.5">·</span>
+                </>
+            )}
             <span className="min-w-0 truncate">{modelLabel}</span>
             {effortLabel && (
                 <>

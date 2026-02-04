@@ -129,7 +129,7 @@ export async function selectBackend(
 
   // No backend available
   throw new Error(
-    'No backend available. Please install OpenCode CLI or Claude CLI.'
+    'No backend available. Please install OpenCode CLI or Claude Code CLI.'
   );
 }
 

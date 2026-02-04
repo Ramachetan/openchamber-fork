@@ -29,11 +29,21 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     private readonly _extensionUri: vscode.Uri,
     private readonly _backendManager?: UnifiedBackendManager
   ) {
-    // Extract OpenCodeManager from backend if using OpenCode
-    if (_backendManager?.getBackendType() === 'opencode') {
-      const backend = _backendManager.getActiveBackend() as OpenCodeAdapter;
+    this._refreshBackendBinding();
+  }
+
+  public refreshBackend(): void {
+    this._refreshBackendBinding();
+    this._sendCachedState();
+  }
+
+  private _refreshBackendBinding(): void {
+    if (this._backendManager?.getBackendType() === 'opencode') {
+      const backend = this._backendManager.getActiveBackend() as OpenCodeAdapter;
       this._openCodeManager = backend?.getOpenCodeManager?.();
+      return;
     }
+    this._openCodeManager = undefined;
   }
 
   public resolveWebviewView(
@@ -76,6 +86,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       const response = await handleBridgeMessage(message, {
         manager: this._openCodeManager,
         context: this._context,
+        backendManager: this._backendManager,
       });
       webviewView.webview.postMessage(response);
     });
@@ -167,6 +178,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       type: 'connectionStatus',
       status: this._cachedStatus,
       error: this._cachedError,
+      backendType: this._backendManager?.getBackendType() || 'unknown',
     });
   }
 
@@ -385,7 +397,8 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     const workspaceFolder = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath || '';
     // Use cached values which are updated by onStatusChange callback
     const initialStatus = this._cachedStatus;
-    const cliAvailable = this._openCodeManager?.isCliAvailable() ?? false;
+    const backendType = this._backendManager?.getBackendType() || 'unknown';
+    const cliAvailable = this._backendManager?.getActiveBackend()?.getDebugInfo().cliAvailable ?? true;
 
     return getWebviewHtml({
       webview,
@@ -393,6 +406,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       workspaceFolder,
       initialStatus,
       cliAvailable,
+      backendType,
     });
   }
 }

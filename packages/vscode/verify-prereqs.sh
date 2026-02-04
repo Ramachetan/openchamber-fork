@@ -65,9 +65,9 @@ fi
 
 if command -v claude &> /dev/null; then
     version=$(claude --version 2>&1 | head -1)
-    echo -e "${check_mark} Claude CLI: $version"
+    echo -e "${check_mark} Claude Code CLI: $version"
 else
-    echo -e "${warning_mark} Claude CLI: Not installed (optional)"
+    echo -e "${warning_mark} Claude Code CLI: Not installed (optional)"
 fi
 
 # Check if at least one backend is available

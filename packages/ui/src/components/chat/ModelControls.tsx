@@ -256,6 +256,7 @@ interface ModelControlsProps {
     mobilePanel?: MobileControlsPanel;
     onMobilePanelChange?: (panel: MobileControlsPanel) => void;
     onMobilePanelSelection?: () => void;
+    hideAgentControls?: boolean;
 }
 
 export const ModelControls: React.FC<ModelControlsProps> = ({
@@ -263,6 +264,7 @@ export const ModelControls: React.FC<ModelControlsProps> = ({
     mobilePanel,
     onMobilePanelChange,
     onMobilePanelSelection,
+    hideAgentControls = false,
 }) => {
     const {
         providers,
@@ -2620,15 +2622,15 @@ export const ModelControls: React.FC<ModelControlsProps> = ({
                 >
                     {renderVariantSelector()}
                     {renderModelSelector()}
-                    {renderAgentSelector()}
+                    {!hideAgentControls && renderAgentSelector()}
                 </div>
             </div>
 
             {renderMobileModelPanel()}
             {renderMobileVariantPanel()}
-            {renderMobileAgentPanel()}
+            {!hideAgentControls && renderMobileAgentPanel()}
             {renderMobileModelTooltip()}
-            {renderMobileAgentTooltip()}
+            {!hideAgentControls && renderMobileAgentTooltip()}
         </>
     );
 

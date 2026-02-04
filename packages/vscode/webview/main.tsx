@@ -21,6 +21,7 @@ declare global {
       workspaceFolder: string;
       theme: string;
       connectionStatus: string;
+      backendType?: 'opencode' | 'claude-cli' | 'unknown';
       cliAvailable?: boolean;
       panelType?: PanelType;
       viewMode?: 'sidebar' | 'editor';
@@ -63,8 +64,13 @@ const handleConnectionMessage = (event: MessageEvent) => {
   if (msg?.type === 'connectionStatus') {
     const payload: ConnectionStatus = msg.status;
     const error: string | undefined = msg.error;
+    const backendType = typeof msg.backendType === 'string' ? msg.backendType : undefined;
     const prevCliAvailable = window.__OPENCHAMBER_CONNECTION__?.cliAvailable ?? true;
     window.__OPENCHAMBER_CONNECTION__ = { status: payload, error, cliAvailable: prevCliAvailable };
+    if (backendType && window.__VSCODE_CONFIG__) {
+      window.__VSCODE_CONFIG__.backendType = backendType as 'opencode' | 'claude-cli' | 'unknown';
+      window.dispatchEvent(new CustomEvent('openchamber:backend-changed', { detail: { backendType } }));
+    }
     window.dispatchEvent(new CustomEvent('openchamber:connection-status', { detail: { status: payload, error } }));
   }
 };
@@ -146,12 +152,19 @@ const recordBootstrapFetch = (pathname: string, ok: boolean) => {
 
 const maybeHideLoadingOverlay = () => {
   const connectionStatus = window.__OPENCHAMBER_CONNECTION__?.status ?? 'connecting';
+  const backendType = window.__VSCODE_CONFIG__?.backendType ?? 'unknown';
+  const isClaudeBackend = backendType === 'claude-cli';
 
   if (!uiMounted) {
     return;
   }
 
   if (connectionStatus === 'connected') {
+    if (isClaudeBackend) {
+      fadeOutLoadingScreen();
+      return;
+    }
+
     if (bootstrapFailed) {
       setLoadingStatusText('OpenCode connected, but initial data load failed.', 'error');
       fadeOutLoadingScreen();
@@ -182,7 +195,7 @@ const maybeHideLoadingOverlay = () => {
     return;
   }
 
-  setLoadingStatusText('Starting OpenCode API…');
+  setLoadingStatusText(backendType === 'claude-cli' ? 'Starting Claude Code…' : 'Starting OpenCode API…');
 };
 
 const applyInitialTheme = (theme: { metadata?: { variant?: string }; colors?: { surface?: { background?: string; foreground?: string } } }) => {
@@ -656,6 +669,61 @@ const handleLocalApiRequest = async (url: URL, init?: RequestInit) => {
       const message = error instanceof Error ? error.message : String(error);
       return new Response(JSON.stringify({ error: message }), { status: 500, headers: { 'Content-Type': 'application/json' } });
     }
+  }
+
+  if (pathname === '/api/claude/providers' && (init?.method || 'GET').toUpperCase() === 'GET') {
+    const data = await sendBridgeMessage('api:claude/providers');
+    return new Response(JSON.stringify(data), { status: 200, headers: { 'Content-Type': 'application/json' } });
+  }
+
+  if (pathname === '/api/claude/agents' && (init?.method || 'GET').toUpperCase() === 'GET') {
+    const data = await sendBridgeMessage('api:claude/agents');
+    return new Response(JSON.stringify(data), { status: 200, headers: { 'Content-Type': 'application/json' } });
+  }
+
+  if (pathname === '/api/claude/session/status' && (init?.method || 'GET').toUpperCase() === 'GET') {
+    const data = await sendBridgeMessage('api:claude/session/status');
+    return new Response(JSON.stringify(data), { status: 200, headers: { 'Content-Type': 'application/json' } });
+  }
+
+  if (pathname === '/api/claude/session') {
+    const method = (init?.method || 'GET').toUpperCase();
+    const body = init?.body ? JSON.parse(init.body as string) : {};
+    const querySessionId = url.searchParams.get('sessionId');
+    const data = await sendBridgeMessage('api:claude/session', {
+      method,
+      sessionId: querySessionId ?? body.sessionId,
+      title: body.title,
+      parentID: body.parentID,
+      directory: body.directory,
+    });
+    return new Response(JSON.stringify(data), { status: 200, headers: { 'Content-Type': 'application/json' } });
+  }
+
+  const claudeSessionMessagesMatch = pathname.match(/^\/api\/claude\/session\/([^/]+)\/messages$/);
+  if (claudeSessionMessagesMatch && (init?.method || 'GET').toUpperCase() === 'GET') {
+    const sessionId = decodeURIComponent(claudeSessionMessagesMatch[1]);
+    const limitRaw = url.searchParams.get('limit');
+    const limit = limitRaw ? Number(limitRaw) : undefined;
+    const data = await sendBridgeMessage('api:claude/session/messages', {
+      sessionId,
+      limit: Number.isFinite(limit) ? limit : undefined,
+    });
+    return new Response(JSON.stringify(data), { status: 200, headers: { 'Content-Type': 'application/json' } });
+  }
+
+  const claudeSessionPromptMatch = pathname.match(/^\/api\/claude\/session\/([^/]+)\/prompt$/);
+  if (claudeSessionPromptMatch && (init?.method || 'POST').toUpperCase() === 'POST') {
+    const sessionId = decodeURIComponent(claudeSessionPromptMatch[1]);
+    const body = init?.body ? JSON.parse(init.body as string) : {};
+    const data = await sendBridgeMessage('api:claude/session/prompt', {
+      sessionId,
+      text: body.text,
+      providerID: body.providerID,
+      modelID: body.modelID,
+      mode: body.mode,
+    });
+    return new Response(JSON.stringify(data), { status: 200, headers: { 'Content-Type': 'application/json' } });
   }
 
   return null;

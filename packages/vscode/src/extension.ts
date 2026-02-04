@@ -3,7 +3,8 @@ import { ChatViewProvider } from './ChatViewProvider';
 import { AgentManagerPanelProvider } from './AgentManagerPanelProvider';
 import { SessionEditorPanelProvider } from './SessionEditorPanelProvider';
 import { UnifiedBackendManager } from './backends/backendManager';
-import type { BackendDebugInfo, BackendManager as BackendManagerInterface } from './backends/types';
+import type { BackendDebugInfo, BackendManager as BackendManagerInterface, BackendType, ConnectionStatus } from './backends/types';
+import { detectAvailableBackends, selectBackend } from './backends/detector';
 import type { OpenCodeManager } from './opencode';
 import { startGlobalEventWatcher, stopGlobalEventWatcher, setChatViewProvider } from './sessionActivityWatcher';
 
@@ -12,6 +13,7 @@ let agentManagerProvider: AgentManagerPanelProvider | undefined;
 let sessionEditorProvider: SessionEditorPanelProvider | undefined;
 let backendManager: UnifiedBackendManager | undefined;
 let outputChannel: vscode.OutputChannel | undefined;
+let backendStatusSubscription: vscode.Disposable | undefined;
 
 let activeSessionId: string | null = null;
 let activeSessionTitle: string | null = null;
@@ -215,6 +217,51 @@ export async function activate(context: vscode.ExtensionContext) {
   agentManagerProvider = new AgentManagerPanelProvider(context, context.extensionUri, backendManager);
   sessionEditorProvider = new SessionEditorPanelProvider(context, context.extensionUri, backendManager);
 
+  const broadcastBackendStatus = (status: ConnectionStatus, error?: string) => {
+    chatViewProvider?.updateConnectionStatus(status, error);
+    agentManagerProvider?.updateConnectionStatus(status, error);
+    sessionEditorProvider?.updateConnectionStatus(status, error);
+
+    if (status === 'connected' && chatViewProvider && backendManager?.getBackendType() === 'opencode') {
+      const active = backendManager.getActiveBackend();
+      const openCodeManager = active && hasOpenCodeManagerGetter(active)
+        ? active.getOpenCodeManager?.()
+        : undefined;
+      if (openCodeManager) {
+        setChatViewProvider(chatViewProvider);
+        void startGlobalEventWatcher(openCodeManager, chatViewProvider);
+      }
+    } else if (status === 'disconnected' || status === 'error') {
+      stopGlobalEventWatcher();
+    }
+  };
+
+  const bindBackendStatusSubscription = () => {
+    backendStatusSubscription?.dispose();
+    backendStatusSubscription = undefined;
+
+    const active = backendManager?.getActiveBackend();
+    if (!active) return;
+
+    const unsubscribeStatus = active.onStatusChange((status) => {
+      broadcastBackendStatus(status, undefined);
+    });
+
+    const unsubscribeError = active.onError((error) => {
+      broadcastBackendStatus('error', error.message);
+    });
+
+    backendStatusSubscription = {
+      dispose: () => {
+        unsubscribeStatus();
+        unsubscribeError();
+      },
+    };
+
+    const currentStatus = active.getStatus();
+    broadcastBackendStatus(currentStatus, undefined);
+  };
+
   context.subscriptions.push(
     vscode.commands.registerCommand('neusis-code.openAgentManager', () => {
       agentManagerProvider?.createOrShow();
@@ -387,6 +434,98 @@ export async function activate(context: vscode.ExtensionContext) {
   context.subscriptions.push(
     vscode.commands.registerCommand('neusis-code.showSettings', () => {
       chatViewProvider?.showSettings();
+    })
+  );
+
+  context.subscriptions.push(
+    vscode.commands.registerCommand('neusis-code.getBackendState', () => {
+      const config = vscode.workspace.getConfiguration('neusis-code');
+      const configuredBackend = config.get<string>('backend', 'auto');
+      const detection = backendManager?.getDetectionResult();
+
+      return {
+        currentBackend: backendManager?.getBackendType() || 'unknown',
+        configuredBackend,
+        availableBackends: detection?.available || [],
+        recommendedBackend: detection?.recommended || null,
+      };
+    })
+  );
+
+  context.subscriptions.push(
+    vscode.commands.registerCommand('neusis-code.setBackendPreference', async (backend: 'auto' | BackendType) => {
+      if (backend !== 'auto' && backend !== 'opencode' && backend !== 'claude-cli') {
+        throw new Error(`Invalid backend preference: ${String(backend)}`);
+      }
+
+      const config = vscode.workspace.getConfiguration('neusis-code');
+
+      if (!backendManager) {
+        await config.update('backend', backend, vscode.ConfigurationTarget.Global);
+        return false;
+      }
+
+      const targetBackend = backend === 'auto'
+        ? await (async () => {
+            const detection = await detectAvailableBackends(config);
+            return selectBackend(detection, undefined);
+          })()
+        : backend;
+      const currentBackend = backendManager.getBackendType();
+      let effectiveBackend: BackendType | null = currentBackend;
+      let fallbackUsed = false;
+
+      if (currentBackend !== targetBackend) {
+        try {
+          await backendManager.switchBackend(targetBackend);
+          effectiveBackend = targetBackend;
+        } catch (error) {
+          const switchError = error instanceof Error ? error.message : String(error);
+          outputChannel?.appendLine(`[Neusis Code] Backend switch to ${targetBackend} failed: ${switchError}`);
+
+          // Reliability fallback: if explicit OpenCode switch fails, attempt auto-detection once.
+          if (targetBackend === 'opencode') {
+            const detection = await detectAvailableBackends(config);
+            const fallbackTarget = await selectBackend(detection, undefined);
+            outputChannel?.appendLine(`[Neusis Code] Fallback backend target after failed OpenCode switch: ${fallbackTarget}`);
+            if (fallbackTarget !== targetBackend || backend === 'auto') {
+              await backendManager.switchBackend(fallbackTarget);
+              effectiveBackend = fallbackTarget;
+              fallbackUsed = true;
+            } else {
+              throw error;
+            }
+          } else {
+            throw error;
+          }
+        }
+      } else {
+        effectiveBackend = currentBackend;
+      }
+
+      if (!effectiveBackend) {
+        effectiveBackend = backendManager.getBackendType();
+      }
+      if (!effectiveBackend) {
+        throw new Error('No active backend after backend switch');
+      }
+
+      let persistedPreference: 'auto' | BackendType = 'auto';
+      if (backend !== 'auto' && effectiveBackend === targetBackend) {
+        persistedPreference = backend;
+      }
+      await config.update('backend', persistedPreference, vscode.ConfigurationTarget.Global);
+
+      chatViewProvider?.refreshBackend();
+      agentManagerProvider?.refreshBackend();
+      sessionEditorProvider?.refreshBackend();
+      bindBackendStatusSubscription();
+
+      const switchMessage = fallbackUsed
+        ? `Neusis Code: Switched backend to ${effectiveBackend} (fallback from ${targetBackend}). Preference set to auto.`
+        : `Neusis Code: Switched backend to ${effectiveBackend}`;
+      vscode.window.showInformationMessage(switchMessage);
+      return true;
     })
   );
 
@@ -597,39 +736,15 @@ export async function activate(context: vscode.ExtensionContext) {
     })
   );
 
-  // Subscribe to status changes - this broadcasts to webview
-  const activeBackend = backendManager?.getActiveBackend();
-  if (activeBackend && backendManager) {
-    const unsubscribe = activeBackend.onStatusChange((status) => {
-      const error = undefined; // Error handling is done via onError
-      chatViewProvider?.updateConnectionStatus(status, error);
-      agentManagerProvider?.updateConnectionStatus(status, error);
-      sessionEditorProvider?.updateConnectionStatus(status, error);
-
-      // Start/stop global event watcher based on connection status
-      // Mirrors web server and desktop Tauri behavior
-      // Only for OpenCode backend
-      if (status === 'connected' && chatViewProvider && backendManager?.getBackendType() === 'opencode') {
-        const openCodeManager = hasOpenCodeManagerGetter(activeBackend)
-          ? activeBackend.getOpenCodeManager?.()
-          : undefined;
-        if (openCodeManager) {
-          setChatViewProvider(chatViewProvider);
-          void startGlobalEventWatcher(openCodeManager, chatViewProvider);
-        }
-      } else if (status === 'disconnected' || status === 'error') {
-        stopGlobalEventWatcher();
-      }
-    });
-
-    context.subscriptions.push({ dispose: unsubscribe });
-  }
+  bindBackendStatusSubscription();
 
   // Backend already initialized earlier (before creating view providers)
   // This ensures proper backend detection and prevents "CLI not found" errors
 }
 
 export async function deactivate() {
+  backendStatusSubscription?.dispose();
+  backendStatusSubscription = undefined;
   stopGlobalEventWatcher();
   await backendManager?.dispose();
   backendManager = undefined;

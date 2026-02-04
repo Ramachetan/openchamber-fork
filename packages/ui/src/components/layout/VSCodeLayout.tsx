@@ -70,6 +70,8 @@ export const VSCodeLayout: React.FC = () => {
   const [hasInitializedOnce, setHasInitializedOnce] = React.useState<boolean>(() => configInitialized);
   const [isInitializing, setIsInitializing] = React.useState<boolean>(false);
   const lastBootstrapAttemptAt = React.useRef<number>(0);
+  const bootstrapFailureCount = React.useRef<number>(0);
+  const autoRestartTriggered = React.useRef<boolean>(false);
 
   // Navigate to chat when a session is selected
   React.useEffect(() => {
@@ -145,6 +147,13 @@ export const VSCodeLayout: React.FC = () => {
 
   // Bootstrap config and sessions when connected
   React.useEffect(() => {
+    if (connectionStatus !== 'connected') {
+      bootstrapFailureCount.current = 0;
+      autoRestartTriggered.current = false;
+    }
+  }, [connectionStatus]);
+
+  React.useEffect(() => {
     const runBootstrap = async () => {
       if (isInitializing || hasInitializedOnce || connectionStatus !== 'connected') {
         return;
@@ -173,6 +182,23 @@ export const VSCodeLayout: React.FC = () => {
         // If OpenCode is still warming up, the initial provider/agent loads can fail and be swallowed by retries.
         // Only mark bootstrap complete when core datasets are present so we keep retrying on cold starts.
         if (!configState.isInitialized || !configState.isConnected || configState.providers.length === 0 || configState.agents.length === 0) {
+          bootstrapFailureCount.current += 1;
+          const backendType =
+            typeof window !== 'undefined'
+              ? ((window as unknown as { __VSCODE_CONFIG__?: { backendType?: string } }).__VSCODE_CONFIG__?.backendType ?? 'unknown')
+              : 'unknown';
+          const shouldAutoRestart =
+            backendType === 'opencode' &&
+            !autoRestartTriggered.current &&
+            bootstrapFailureCount.current >= 2 &&
+            Boolean(runtimeApis.vscode);
+
+          if (shouldAutoRestart) {
+            autoRestartTriggered.current = true;
+            void runtimeApis.vscode?.executeCommand('neusis-code.restartApi').catch(() => {
+              autoRestartTriggered.current = false;
+            });
+          }
           return;
         }
         await loadSessions();
@@ -184,17 +210,20 @@ export const VSCodeLayout: React.FC = () => {
           sessionsError,
         });
         if (typeof sessionsError === 'string' && sessionsError.length > 0) {
+          bootstrapFailureCount.current += 1;
           return;
         }
+        bootstrapFailureCount.current = 0;
         setHasInitializedOnce(true);
       } catch {
+        bootstrapFailureCount.current += 1;
         // Ignore bootstrap failures
       } finally {
         setIsInitializing(false);
       }
     };
     void runBootstrap();
-  }, [connectionStatus, configInitialized, hasInitializedOnce, initializeConfig, isInitializing, loadSessions]);
+  }, [connectionStatus, configInitialized, hasInitializedOnce, initializeConfig, isInitializing, loadSessions, runtimeApis.vscode]);
 
   React.useEffect(() => {
     if (viewMode !== 'editor') {
@@ -282,6 +311,7 @@ export const VSCodeLayout: React.FC = () => {
             title={sessions.find((session) => session.id === currentSessionId)?.title || 'Chat'}
             showMcp
             showContextUsage
+            showBackendSelector
           />
           <div className="flex-1 overflow-hidden">
             <ErrorBoundary>
@@ -318,6 +348,7 @@ export const VSCodeLayout: React.FC = () => {
                 : sessions.find((session) => session.id === currentSessionId)?.title || 'Chat'}
               showMcp
               showContextUsage
+              showBackendSelector
             />
             <div className="flex-1 overflow-hidden">
               <ErrorBoundary>
@@ -353,6 +384,7 @@ export const VSCodeLayout: React.FC = () => {
             onBack={handleBackToSessions}
             showMcp
             showContextUsage
+            showBackendSelector
           />
           <div className="flex-1 overflow-hidden">
             <ErrorBoundary>
@@ -374,11 +406,27 @@ interface VSCodeHeaderProps {
   onAgentManager?: () => void;
   showMcp?: boolean;
   showContextUsage?: boolean;
+  showBackendSelector?: boolean;
 }
 
-const VSCodeHeader: React.FC<VSCodeHeaderProps> = ({ title, showBack, onBack, onNewSession, onSettings, onAgentManager, showMcp, showContextUsage }) => {
+type BackendPreference = 'auto' | 'opencode' | 'claude-cli';
+
+const VSCodeHeader: React.FC<VSCodeHeaderProps> = ({
+  title,
+  showBack,
+  onBack,
+  onNewSession,
+  onSettings,
+  onAgentManager,
+  showMcp,
+  showContextUsage,
+  showBackendSelector,
+}) => {
+  const runtimeApis = useRuntimeAPIs();
   const { getCurrentModel } = useConfigStore();
   const getContextUsage = useSessionStore((state) => state.getContextUsage);
+  const [configuredBackend, setConfiguredBackend] = React.useState<BackendPreference>('auto');
+  const [isSwitchingBackend, setIsSwitchingBackend] = React.useState(false);
 
   const currentModel = getCurrentModel();
   const limits = (currentModel?.limit && typeof currentModel.limit === 'object'
@@ -387,6 +435,54 @@ const VSCodeHeader: React.FC<VSCodeHeaderProps> = ({ title, showBack, onBack, on
   const contextLimit = typeof limits?.context === 'number' ? limits.context : 0;
   const outputLimit = typeof limits?.output === 'number' ? limits.output : 0;
   const contextUsage = getContextUsage(contextLimit, outputLimit);
+
+  React.useEffect(() => {
+    if (!showBackendSelector || !runtimeApis.vscode) {
+      return;
+    }
+
+    let isMounted = true;
+    const loadBackendState = async () => {
+      try {
+        const state = await runtimeApis.vscode?.executeCommand('neusis-code.getBackendState');
+        if (!isMounted || !state || typeof state !== 'object') {
+          return;
+        }
+        const value = (state as { configuredBackend?: unknown }).configuredBackend;
+        if (value === 'auto' || value === 'opencode' || value === 'claude-cli') {
+          setConfiguredBackend(value);
+        }
+      } catch {
+        // ignore and keep the current value
+      }
+    };
+
+    void loadBackendState();
+    return () => {
+      isMounted = false;
+    };
+  }, [runtimeApis.vscode, showBackendSelector]);
+
+  const handleBackendChange = React.useCallback(
+    async (event: React.ChangeEvent<HTMLSelectElement>) => {
+      if (!runtimeApis.vscode) {
+        return;
+      }
+      const next = event.target.value as BackendPreference;
+      if (next !== 'auto' && next !== 'opencode' && next !== 'claude-cli') {
+        return;
+      }
+
+      setConfiguredBackend(next);
+      setIsSwitchingBackend(true);
+      try {
+        await runtimeApis.vscode.executeCommand('neusis-code.setBackendPreference', next);
+      } finally {
+        setIsSwitchingBackend(false);
+      }
+    },
+    [runtimeApis.vscode]
+  );
 
   return (
     <div className="flex items-center gap-1.5 pl-1 pr-2 py-1 border-b border-border bg-background shrink-0">
@@ -422,6 +518,22 @@ const VSCodeHeader: React.FC<VSCodeHeaderProps> = ({ title, showBack, onBack, on
         <McpDropdown
           headerIconButtonClass="inline-flex h-9 w-9 items-center justify-center p-2 text-muted-foreground hover:text-foreground transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary"
         />
+      )}
+      {showBackendSelector && runtimeApis.vscode && (
+        <label className="inline-flex h-7 items-center rounded-md border border-border/70 bg-sidebar/30 px-2 text-xs text-muted-foreground">
+          <span className="mr-1">Backend</span>
+          <select
+            value={configuredBackend}
+            onChange={handleBackendChange}
+            disabled={isSwitchingBackend}
+            className="bg-transparent text-foreground outline-none"
+            aria-label="Select backend"
+          >
+            <option value="auto">Auto</option>
+            <option value="opencode">OpenCode</option>
+            <option value="claude-cli">Claude Code</option>
+          </select>
+        </label>
       )}
       {onSettings && (
         <button
