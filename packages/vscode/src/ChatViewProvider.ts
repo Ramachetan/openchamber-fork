@@ -6,7 +6,7 @@ import { getWebviewShikiThemes } from './shikiThemes';
 import { getWebviewHtml } from './webviewHtml';
 
 export class ChatViewProvider implements vscode.WebviewViewProvider {
-  public static readonly viewType = 'openchamber.chatView';
+  public static readonly viewType = 'neusis-code.chatView';
 
   private _view?: vscode.WebviewView;
 

@@ -34,12 +34,12 @@ declare global {
   }
 }
 
-console.log('[OpenChamber] VS Code webview starting...');
-console.log('[OpenChamber] VS Code webview build:', __OPENCHAMBER_WEBVIEW_BUILD_TIME__);
-console.log('[OpenChamber] Config:', window.__VSCODE_CONFIG__);
+console.log('[Neusis Code] VS Code webview starting...');
+console.log('[Neusis Code] VS Code webview build:', __OPENCHAMBER_WEBVIEW_BUILD_TIME__);
+console.log('[Neusis Code] Config:', window.__VSCODE_CONFIG__);
 try {
   if (window.localStorage.getItem('openchamber_stream_debug') === '1') {
-    console.log('[OpenChamber] Debug: openchamber_stream_debug=1');
+    console.log('[Neusis Code] Debug: openchamber_stream_debug=1');
   }
 } catch {
   // ignore

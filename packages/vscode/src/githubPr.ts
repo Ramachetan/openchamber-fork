@@ -115,7 +115,7 @@ const githubFetch = async (
     headers: {
       Accept: 'application/vnd.github+json',
       Authorization: `Bearer ${accessToken}`,
-      'User-Agent': 'OpenChamber',
+      'User-Agent': 'NeusisCode',
       ...(init?.headers || {}),
     },
   });

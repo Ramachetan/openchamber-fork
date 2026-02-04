@@ -107,10 +107,10 @@ export function getWebviewHtml(options: WebviewHtmlOptions): string {
       50% { opacity: 1; }
     }
   </style>
-  <title>OpenChamber</title>
+  <title>Neusis Code</title>
 </head>
 <body>
-  <!-- Initial loading screen with simplified OpenChamber logo -->
+  <!-- Initial loading screen with simplified Neusis Code logo -->
   <div id="initial-loading">
     <svg class="logo" width="70" height="70" viewBox="0 0 100 100" fill="none" xmlns="http://www.w3.org/2000/svg">
       <!-- Left face -->

@@ -1,9 +1,9 @@
 {
-  "name": "openchamber",
-  "displayName": "OpenChamber",
+  "name": "neusis-code",
+  "displayName": "Neusis Code",
   "description": "AI coding assistant powered by OpenCode",
   "version": "1.6.1",
-  "publisher": "fedaykindev",
+  "publisher": "neusis",
   "private": true,
   "repository": {
     "type": "git",
@@ -29,37 +29,38 @@
     "groq",
     "assistant",
     "opencode",
-    "openchamber"
+    "neusis",
+    "neusis-code"
   ],
   "icon": "assets/app-icon.png",
   "main": "./dist/extension.js",
   "activationEvents": [
-    "onCommand:openchamber.openSidebar",
-    "onView:openchamber.chatView"
+    "onCommand:neusis-code.openSidebar",
+    "onView:neusis-code.chatView"
   ],
   "contributes": {
     "viewsContainers": {
       "activitybar": [
         {
-          "id": "openchamber",
-          "title": "OpenChamber",
+          "id": "neusis-code",
+          "title": "Neusis Code",
           "icon": "assets/icon.svg"
         }
       ]
     },
     "views": {
-      "openchamber": [
+      "neusis-code": [
         {
           "type": "webview",
-          "id": "openchamber.chatView",
+          "id": "neusis-code.chatView",
           "name": "Chat"
         }
       ]
     },
     "commands": [
       {
-        "command": "openchamber.openSidebar",
-        "category": "OpenChamber",
+        "command": "neusis-code.openSidebar",
+        "category": "Neusis Code",
         "title": "Open Sidebar",
         "icon": {
           "light": "assets/icon.svg",
@@ -67,35 +68,35 @@
         }
       },
       {
-        "command": "openchamber.focusChat",
-        "category": "OpenChamber",
+        "command": "neusis-code.focusChat",
+        "category": "Neusis Code",
         "title": "Focus Chat"
       },
       {
-        "command": "openchamber.restartApi",
-        "category": "OpenChamber",
+        "command": "neusis-code.restartApi",
+        "category": "Neusis Code",
         "title": "Restart API Connection"
       },
       {
-        "command": "openchamber.showOpenCodeStatus",
-        "category": "OpenChamber",
+        "command": "neusis-code.showOpenCodeStatus",
+        "category": "Neusis Code",
         "title": "Show OpenCode Status"
       },
       {
-        "command": "openchamber.openAgentManager",
-        "category": "OpenChamber",
+        "command": "neusis-code.openAgentManager",
+        "category": "Neusis Code",
         "title": "Open Agent Manager",
         "icon": "$(circuit-board)"
       },
       {
-        "command": "openchamber.openActiveSessionInEditor",
-        "category": "OpenChamber",
+        "command": "neusis-code.openActiveSessionInEditor",
+        "category": "Neusis Code",
         "title": "Open Active Session in Editor",
         "icon": "$(link-external)"
       },
       {
-        "command": "openchamber.openNewSessionInEditor",
-        "category": "OpenChamber",
+        "command": "neusis-code.openNewSessionInEditor",
+        "category": "Neusis Code",
         "title": "Open New Session in Editor",
         "icon": {
           "light": "assets/icon.svg",
@@ -103,96 +104,96 @@
         }
       },
       {
-        "command": "openchamber.openCurrentOrNewSessionInEditor",
-        "category": "OpenChamber",
+        "command": "neusis-code.openCurrentOrNewSessionInEditor",
+        "category": "Neusis Code",
         "title": "Open Session in Editor",
         "icon": "$(link-external)"
       },
       {
-        "command": "openchamber.addToContext",
-        "category": "OpenChamber",
+        "command": "neusis-code.addToContext",
+        "category": "Neusis Code",
         "title": "Add to Context"
       },
       {
-        "command": "openchamber.explain",
-        "category": "OpenChamber",
+        "command": "neusis-code.explain",
+        "category": "Neusis Code",
         "title": "Explain"
       },
       {
-        "command": "openchamber.improveCode",
-        "category": "OpenChamber",
+        "command": "neusis-code.improveCode",
+        "category": "Neusis Code",
         "title": "Improve Code"
       },
       {
-        "command": "openchamber.newSession",
-        "category": "OpenChamber",
+        "command": "neusis-code.newSession",
+        "category": "Neusis Code",
         "title": "New Session",
         "icon": "$(add)"
       },
       {
-        "command": "openchamber.showSettings",
-        "category": "OpenChamber",
+        "command": "neusis-code.showSettings",
+        "category": "Neusis Code",
         "title": "Settings",
         "icon": "$(settings-gear)"
       }
     ],
     "submenus": [
       {
-        "id": "openchamber.submenu",
-        "label": "OpenChamber"
+        "id": "neusis-code.submenu",
+        "label": "Neusis Code"
       }
     ],
     "menus": {
       "editor/context": [
         {
-          "submenu": "openchamber.submenu",
+          "submenu": "neusis-code.submenu",
           "group": "navigation"
         }
       ],
       "editor/title": [
         {
-          "command": "openchamber.openNewSessionInEditor",
+          "command": "neusis-code.openNewSessionInEditor",
           "group": "navigation@1"
         }
       ],
       "view/title": [
         {
-          "command": "openchamber.newSession",
-          "when": "view == openchamber.chatView",
+          "command": "neusis-code.newSession",
+          "when": "view == neusis-code.chatView",
           "group": "navigation@1"
         },
         {
-          "command": "openchamber.openCurrentOrNewSessionInEditor",
-          "when": "view == openchamber.chatView",
+          "command": "neusis-code.openCurrentOrNewSessionInEditor",
+          "when": "view == neusis-code.chatView",
           "group": "navigation@2"
         },
         {
-          "command": "openchamber.openAgentManager",
-          "when": "view == openchamber.chatView",
+          "command": "neusis-code.openAgentManager",
+          "when": "view == neusis-code.chatView",
           "group": "navigation@3"
         },
         {
-          "command": "openchamber.showSettings",
-          "when": "view == openchamber.chatView",
+          "command": "neusis-code.showSettings",
+          "when": "view == neusis-code.chatView",
           "group": "navigation@4"
         }
       ],
-      "openchamber.submenu": [
+      "neusis-code.submenu": [
         {
-          "command": "openchamber.explain"
+          "command": "neusis-code.explain"
         },
         {
-          "command": "openchamber.improveCode"
+          "command": "neusis-code.improveCode"
         },
         {
-          "command": "openchamber.addToContext"
+          "command": "neusis-code.addToContext"
         }
       ]
     },
     "configuration": {
-      "title": "OpenChamber",
+      "title": "Neusis Code",
       "properties": {
-        "openchamber.apiUrl": {
+        "neusis-code.apiUrl": {
           "type": "string",
           "default": "",
           "description": "URL of an external OpenCode API server. Leave empty to auto-start a local instance."

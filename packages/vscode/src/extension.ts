@@ -14,7 +14,7 @@ let outputChannel: vscode.OutputChannel | undefined;
 let activeSessionId: string | null = null;
 let activeSessionTitle: string | null = null;
 
-const SETTINGS_KEY = 'openchamber.settings';
+const SETTINGS_KEY = 'neusis-code.settings';
 
 const formatIso = (value: number | null | undefined) => {
   if (typeof value !== 'number' || !Number.isFinite(value)) return '(none)';
@@ -32,7 +32,7 @@ const formatDurationMs = (value: number | null | undefined) => {
 };
 
 export async function activate(context: vscode.ExtensionContext) {
-  outputChannel = vscode.window.createOutputChannel('OpenChamber');
+  outputChannel = vscode.window.createOutputChannel('Neusis Code');
 
   let moveToRightSidebarScheduled = false;
 
@@ -74,12 +74,12 @@ export async function activate(context: vscode.ExtensionContext) {
     if (!moveCommandId) return 'unsupported';
 
     try {
-      await vscode.commands.executeCommand('openchamber.chatView.focus');
+      await vscode.commands.executeCommand('neusis-code.chatView.focus');
       await vscode.commands.executeCommand(moveCommandId);
       return 'moved';
     } catch (error) {
       outputChannel?.appendLine(
-        `[OpenChamber] Failed moving chat view to right sidebar (command=${moveCommandId}): ${error instanceof Error ? error.message : String(error)}`
+        `[Neusis Code] Failed moving chat view to right sidebar (command=${moveCommandId}): ${error instanceof Error ? error.message : String(error)}`
       );
       return 'failed';
     }
@@ -88,9 +88,9 @@ export async function activate(context: vscode.ExtensionContext) {
   const maybeMoveChatToRightSidebarOnStartup = async () => {
     if (isCursorLikeHost()) return;
 
-    const attempted = context.globalState.get<boolean>('openchamber.sidebarAutoMoveAttempted') || false;
+    const attempted = context.globalState.get<boolean>('neusis-code.sidebarAutoMoveAttempted') || false;
     if (attempted) return;
-    await context.globalState.update('openchamber.sidebarAutoMoveAttempted', true);
+    await context.globalState.update('neusis-code.sidebarAutoMoveAttempted', true);
 
     if (moveToRightSidebarScheduled) return;
     moveToRightSidebarScheduled = true;
@@ -109,7 +109,7 @@ export async function activate(context: vscode.ExtensionContext) {
 
 
   // Migration: clear legacy auto-set API URLs (ports 47680-47689 were auto-assigned by older extension versions)
-  const config = vscode.workspace.getConfiguration('openchamber');
+  const config = vscode.workspace.getConfiguration('neusis-code');
   const legacyApiUrl = config.get<string>('apiUrl') || '';
   if (/^https?:\/\/localhost:4768\d\/?$/.test(legacyApiUrl.trim())) {
     await config.update('apiUrl', '', vscode.ConfigurationTarget.Global);
@@ -132,26 +132,26 @@ export async function activate(context: vscode.ExtensionContext) {
 
   // Register sidebar/focus commands AFTER the webview view provider is registered
   context.subscriptions.push(
-    vscode.commands.registerCommand('openchamber.openSidebar', async () => {
+    vscode.commands.registerCommand('neusis-code.openSidebar', async () => {
       // Best-effort: open the container (if available), then focus the chat view.
       try {
-        await vscode.commands.executeCommand('workbench.view.extension.openchamber');
+        await vscode.commands.executeCommand('workbench.view.extension.neusis-code');
       } catch (e) {
-        outputChannel?.appendLine(`[OpenChamber] workbench.view.extension.openchamber failed: ${e}`);
+        outputChannel?.appendLine(`[Neusis Code] workbench.view.extension.neusis-code failed: ${e}`);
       }
 
       try {
-        await vscode.commands.executeCommand('openchamber.chatView.focus');
+        await vscode.commands.executeCommand('neusis-code.chatView.focus');
       } catch (e) {
-        outputChannel?.appendLine(`[OpenChamber] openchamber.chatView.focus failed: ${e}`);
-        vscode.window.showErrorMessage(`OpenChamber: Failed to open sidebar - ${e}`);
+        outputChannel?.appendLine(`[Neusis Code] neusis-code.chatView.focus failed: ${e}`);
+        vscode.window.showErrorMessage(`Neusis Code: Failed to open sidebar - ${e}`);
       }
     })
   );
 
   context.subscriptions.push(
-    vscode.commands.registerCommand('openchamber.focusChat', async () => {
-      await vscode.commands.executeCommand('openchamber.chatView.focus');
+    vscode.commands.registerCommand('neusis-code.focusChat', async () => {
+      await vscode.commands.executeCommand('neusis-code.chatView.focus');
     })
   );
 
@@ -162,13 +162,13 @@ export async function activate(context: vscode.ExtensionContext) {
   sessionEditorProvider = new SessionEditorPanelProvider(context, context.extensionUri, openCodeManager);
 
   context.subscriptions.push(
-    vscode.commands.registerCommand('openchamber.openAgentManager', () => {
+    vscode.commands.registerCommand('neusis-code.openAgentManager', () => {
       agentManagerProvider?.createOrShow();
     })
   );
 
   context.subscriptions.push(
-    vscode.commands.registerCommand('openchamber.setActiveSession', (sessionId: unknown, title?: unknown) => {
+    vscode.commands.registerCommand('neusis-code.setActiveSession', (sessionId: unknown, title?: unknown) => {
       if (typeof sessionId === 'string' && sessionId.trim().length > 0) {
         activeSessionId = sessionId.trim();
         activeSessionTitle = typeof title === 'string' && title.trim().length > 0 ? title.trim() : null;
@@ -181,9 +181,9 @@ export async function activate(context: vscode.ExtensionContext) {
   );
 
   context.subscriptions.push(
-    vscode.commands.registerCommand('openchamber.openActiveSessionInEditor', () => {
+    vscode.commands.registerCommand('neusis-code.openActiveSessionInEditor', () => {
       if (!activeSessionId) {
-        vscode.window.showInformationMessage('OpenChamber: No active session');
+        vscode.window.showInformationMessage('Neusis Code: No active session');
         return;
       }
       sessionEditorProvider?.createOrShow(activeSessionId, activeSessionTitle ?? undefined);
@@ -191,7 +191,7 @@ export async function activate(context: vscode.ExtensionContext) {
   );
 
   context.subscriptions.push(
-    vscode.commands.registerCommand('openchamber.openSessionInEditor', (sessionId: string, title?: string) => {
+    vscode.commands.registerCommand('neusis-code.openSessionInEditor', (sessionId: string, title?: string) => {
       if (typeof sessionId !== 'string' || sessionId.trim().length === 0) {
         return;
       }
@@ -200,13 +200,13 @@ export async function activate(context: vscode.ExtensionContext) {
   );
 
   context.subscriptions.push(
-    vscode.commands.registerCommand('openchamber.openNewSessionInEditor', () => {
+    vscode.commands.registerCommand('neusis-code.openNewSessionInEditor', () => {
       sessionEditorProvider?.createOrShowNewSession();
     })
   );
 
   context.subscriptions.push(
-    vscode.commands.registerCommand('openchamber.openCurrentOrNewSessionInEditor', () => {
+    vscode.commands.registerCommand('neusis-code.openCurrentOrNewSessionInEditor', () => {
       if (activeSessionId) {
         sessionEditorProvider?.createOrShow(activeSessionId, activeSessionTitle ?? undefined);
       } else {
@@ -216,21 +216,21 @@ export async function activate(context: vscode.ExtensionContext) {
   );
 
   context.subscriptions.push(
-    vscode.commands.registerCommand('openchamber.restartApi', async () => {
+    vscode.commands.registerCommand('neusis-code.restartApi', async () => {
       try {
         await openCodeManager?.restart();
-        vscode.window.showInformationMessage('OpenChamber: API connection restarted');
+        vscode.window.showInformationMessage('Neusis Code: API connection restarted');
       } catch (e) {
-        vscode.window.showErrorMessage(`OpenChamber: Failed to restart API - ${e}`);
+        vscode.window.showErrorMessage(`Neusis Code: Failed to restart API - ${e}`);
       }
     })
   );
 
   context.subscriptions.push(
-    vscode.commands.registerCommand('openchamber.addToContext', async () => {
+    vscode.commands.registerCommand('neusis-code.addToContext', async () => {
       const editor = vscode.window.activeTextEditor;
       if (!editor) {
-        vscode.window.showWarningMessage('OpenChamber [Add to Context]:No active editor');
+        vscode.window.showWarningMessage('Neusis Code [Add to Context]:No active editor');
         return;
       }
 
@@ -238,7 +238,7 @@ export async function activate(context: vscode.ExtensionContext) {
       const selectedText = editor.document.getText(selection);
 
       if (!selectedText) {
-        vscode.window.showWarningMessage('OpenChamber [Add to Context]: No text selected');
+        vscode.window.showWarningMessage('Neusis Code [Add to Context]: No text selected');
         return;
       }
 
@@ -258,15 +258,15 @@ export async function activate(context: vscode.ExtensionContext) {
       chatViewProvider?.addTextToInput(contextText);
 
       // Focus the chat panel
-      vscode.commands.executeCommand('openchamber.focusChat');
+      vscode.commands.executeCommand('neusis-code.focusChat');
     })
   );
 
   context.subscriptions.push(
-    vscode.commands.registerCommand('openchamber.explain', async () => {
+    vscode.commands.registerCommand('neusis-code.explain', async () => {
       const editor = vscode.window.activeTextEditor;
       if (!editor) {
-        vscode.window.showWarningMessage('OpenChamber [Explain]: No active editor');
+        vscode.window.showWarningMessage('Neusis Code [Explain]: No active editor');
         return;
       }
 
@@ -290,15 +290,15 @@ export async function activate(context: vscode.ExtensionContext) {
 
       // Create new session and send the prompt
       chatViewProvider?.createNewSessionWithPrompt(prompt);
-      vscode.commands.executeCommand('openchamber.focusChat');
+      vscode.commands.executeCommand('neusis-code.focusChat');
     })
   );
 
   context.subscriptions.push(
-    vscode.commands.registerCommand('openchamber.improveCode', async () => {
+    vscode.commands.registerCommand('neusis-code.improveCode', async () => {
       const editor = vscode.window.activeTextEditor;
       if (!editor) {
-        vscode.window.showWarningMessage('OpenChamber [Improve Code]: No active editor');
+        vscode.window.showWarningMessage('Neusis Code [Improve Code]: No active editor');
         return;
       }
 
@@ -306,7 +306,7 @@ export async function activate(context: vscode.ExtensionContext) {
       const selectedText = editor.document.getText(selection);
 
       if (!selectedText) {
-        vscode.window.showWarningMessage('OpenChamber [Improve Code]: No text selected');
+        vscode.window.showWarningMessage('Neusis Code [Improve Code]: No text selected');
         return;
       }
 
@@ -320,25 +320,25 @@ export async function activate(context: vscode.ExtensionContext) {
 
       // Create new session and send the prompt
       chatViewProvider?.createNewSessionWithPrompt(prompt);
-      vscode.commands.executeCommand('openchamber.focusChat');
+      vscode.commands.executeCommand('neusis-code.focusChat');
     })
   );
 
   context.subscriptions.push(
-    vscode.commands.registerCommand('openchamber.newSession', () => {
+    vscode.commands.registerCommand('neusis-code.newSession', () => {
       chatViewProvider?.createNewSession();
     })
   );
 
   context.subscriptions.push(
-    vscode.commands.registerCommand('openchamber.showSettings', () => {
+    vscode.commands.registerCommand('neusis-code.showSettings', () => {
       chatViewProvider?.showSettings();
     })
   );
 
   context.subscriptions.push(
-    vscode.commands.registerCommand('openchamber.showOpenCodeStatus', async () => {
-      const config = vscode.workspace.getConfiguration('openchamber');
+    vscode.commands.registerCommand('neusis-code.showOpenCodeStatus', async () => {
+      const config = vscode.workspace.getConfiguration('neusis-code');
       const configuredApiUrl = (config.get<string>('apiUrl') || '').trim();
 
       const extensionVersion = String(context.extension?.packageJSON?.version || '');
@@ -445,7 +445,7 @@ export async function activate(context: vscode.ExtensionContext) {
 
       const lines = [
         `Time: ${new Date().toISOString()}`,
-        `OpenChamber version: ${extensionVersion || '(unknown)'}`,
+        `Neusis Code version: ${extensionVersion || '(unknown)'}`,
         `VS Code version: ${vscode.version}`,
         `Platform: ${process.platform} ${process.arch}`,
         `Workspace folders: ${workspaceFolders.length}${workspaceFolders.length ? ` (${workspaceFolders.join(', ')})` : ''}`,
