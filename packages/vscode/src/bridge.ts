@@ -1,10 +1,13 @@
 import * as vscode from 'vscode';
 import * as os from 'os';
 import * as path from 'path';
-import { spawn } from 'child_process';
+import * as fs from 'fs';
+import { spawn, execFile } from 'child_process';
+import { promisify } from 'util';
 import { type OpenCodeManager } from './opencode';
 import { createAgent, createCommand, deleteAgent, deleteCommand, getAgentSources, getCommandSources, updateAgent, updateCommand, type AgentScope, type CommandScope, AGENT_SCOPE, COMMAND_SCOPE, discoverSkills, getSkillSources, createSkill, updateSkill, deleteSkill, readSkillSupportingFile, writeSkillSupportingFile, deleteSkillSupportingFile, type SkillScope, SKILL_SCOPE, getProviderSources, removeProviderConfig } from './opencodeConfig';
 import { getProviderAuth, removeProviderAuth } from './opencodeAuth';
+import { fetchQuotaForProvider, listConfiguredQuotaProviders } from './quotaProviders';
 import * as gitService from './gitService';
 import {
   getSkillsCatalog,
@@ -87,6 +90,8 @@ export interface BridgeContext {
 
 const SETTINGS_KEY = 'openchamber.settings';
 const CLIENT_RELOAD_DELAY_MS = 800;
+const execFileAsync = promisify(execFile);
+const gpgconfCandidates = ['gpgconf', '/opt/homebrew/bin/gpgconf', '/usr/local/bin/gpgconf'];
 
 const readSettings = (ctx?: BridgeContext) => {
   const stored = ctx?.context?.globalState.get<Record<string, unknown>>(SETTINGS_KEY) || {};
@@ -180,6 +185,16 @@ const persistSettings = async (changes: Record<string, unknown>, ctx?: BridgeCon
     }
   }
 
+  if (typeof restChanges.usageAutoRefresh !== 'boolean') {
+    delete restChanges.usageAutoRefresh;
+  }
+
+  if (typeof restChanges.usageRefreshIntervalMs === 'number' && Number.isFinite(restChanges.usageRefreshIntervalMs)) {
+    restChanges.usageRefreshIntervalMs = Math.max(30000, Math.min(300000, Math.round(restChanges.usageRefreshIntervalMs)));
+  } else {
+    delete restChanges.usageRefreshIntervalMs;
+  }
+
   const merged = { ...current, ...restChanges, lastDirectory: current.lastDirectory };
   await ctx?.context?.globalState.update(SETTINGS_KEY, merged);
   return merged;
@@ -187,12 +202,79 @@ const persistSettings = async (changes: Record<string, unknown>, ctx?: BridgeCon
 
 const normalizeFsPath = (value: string) => value.replace(/\\/g, '/');
 
-const execGit = async (args: string[], cwd: string): Promise<{ stdout: string; stderr: string; exitCode: number }> => (
-  new Promise((resolve) => {
+const isSocketPath = async (candidate: string): Promise<boolean> => {
+  if (!candidate) {
+    return false;
+  }
+  try {
+    const stat = await fs.promises.stat(candidate);
+    return typeof stat.isSocket === 'function' && stat.isSocket();
+  } catch {
+    return false;
+  }
+};
+
+const resolveSshAuthSock = async (): Promise<string | undefined> => {
+  const existing = (process.env.SSH_AUTH_SOCK || '').trim();
+  if (existing) {
+    return existing;
+  }
+
+  if (process.platform === 'win32') {
+    return undefined;
+  }
+
+  const gpgSock = path.join(os.homedir(), '.gnupg', 'S.gpg-agent.ssh');
+  if (await isSocketPath(gpgSock)) {
+    return gpgSock;
+  }
+
+  const runGpgconf = async (args: string[]): Promise<string> => {
+    for (const candidate of gpgconfCandidates) {
+      try {
+        const { stdout } = await execFileAsync(candidate, args);
+        return String(stdout || '');
+      } catch {
+        continue;
+      }
+    }
+    return '';
+  };
+
+  const candidate = (await runGpgconf(['--list-dirs', 'agent-ssh-socket'])).trim();
+  if (candidate && await isSocketPath(candidate)) {
+    return candidate;
+  }
+
+  if (candidate) {
+    await runGpgconf(['--launch', 'gpg-agent']);
+    const retried = (await runGpgconf(['--list-dirs', 'agent-ssh-socket'])).trim();
+    if (retried && await isSocketPath(retried)) {
+      return retried;
+    }
+  }
+
+  return undefined;
+};
+
+const buildGitEnv = async (): Promise<NodeJS.ProcessEnv> => {
+  const env: NodeJS.ProcessEnv = { ...process.env, GIT_TERMINAL_PROMPT: '0' };
+  if (!env.SSH_AUTH_SOCK || !env.SSH_AUTH_SOCK.trim()) {
+    const resolved = await resolveSshAuthSock();
+    if (resolved) {
+      env.SSH_AUTH_SOCK = resolved;
+    }
+  }
+  return env;
+};
+
+const execGit = async (args: string[], cwd: string): Promise<{ stdout: string; stderr: string; exitCode: number }> => {
+  const env = await buildGitEnv();
+  return new Promise((resolve) => {
     const proc = spawn('git', args, {
       cwd,
       stdio: ['ignore', 'pipe', 'pipe'],
-      env: { ...process.env, GIT_TERMINAL_PROMPT: '0' },
+      env,
     });
 
     let stdout = '';
@@ -213,8 +295,8 @@ const execGit = async (args: string[], cwd: string): Promise<{ stdout: string; s
     proc.on('error', (error) => {
       resolve({ stdout: '', stderr: error instanceof Error ? error.message : String(error), exitCode: 1 });
     });
-  })
-);
+  });
+};
 
 const gitCheckIgnoreNames = async (cwd: string, names: string[]): Promise<Set<string>> => {
   if (names.length === 0) {
@@ -1908,6 +1990,30 @@ export async function handleBridgeMessage(message: BridgeRequest, ctx?: BridgeCo
           const auth = getProviderAuth(providerId);
           sources.auth.exists = Boolean(auth);
           return { id, type, success: true, data: { providerId, sources } };
+        } catch (error) {
+          const errorMessage = error instanceof Error ? error.message : String(error);
+          return { id, type, success: false, error: errorMessage };
+        }
+      }
+
+      case 'api:quota:providers': {
+        try {
+          const providers = listConfiguredQuotaProviders();
+          return { id, type, success: true, data: { providers } };
+        } catch (error) {
+          const errorMessage = error instanceof Error ? error.message : String(error);
+          return { id, type, success: false, error: errorMessage };
+        }
+      }
+
+      case 'api:quota:get': {
+        const { providerId } = (payload || {}) as { providerId?: string };
+        if (!providerId) {
+          return { id, type, success: false, error: 'Provider ID is required' };
+        }
+        try {
+          const result = await fetchQuotaForProvider(providerId);
+          return { id, type, success: true, data: result };
         } catch (error) {
           const errorMessage = error instanceof Error ? error.message : String(error);
           return { id, type, success: false, error: errorMessage };

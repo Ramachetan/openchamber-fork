@@ -7,6 +7,7 @@ mod opencode_auth;
 mod opencode_config;
 mod opencode_manager;
 mod path_utils;
+mod quota_providers;
 mod session_activity;
 mod skills_catalog;
 mod window_state;
@@ -22,7 +23,7 @@ use anyhow::{anyhow, Result};
 use assistant_notifications::spawn_assistant_notifications;
 use axum::{
     body::{to_bytes, Body},
-    extract::{Request, State},
+    extract::{Path, Request, State},
     http::{Method, StatusCode},
     response::{IntoResponse, Response},
     routing::{any, get, post},
@@ -91,6 +92,8 @@ const CLIENT_RELOAD_DELAY_MS: u64 = 800;
 const MODELS_DEV_API_URL: &str = "https://models.dev/api.json";
 const MODELS_METADATA_CACHE_TTL: Duration = Duration::from_secs(5 * 60);
 const MODELS_METADATA_REQUEST_TIMEOUT: Duration = Duration::from_secs(8);
+
+const MAX_THEME_JSON_BYTES: u64 = 512 * 1024;
 
 const CHECK_FOR_UPDATES_EVENT: &str = "openchamber:check-for-updates";
 
@@ -271,6 +274,11 @@ struct ServerInfoPayload {
     api_prefix: String,
     cli_available: bool,
     has_last_directory: bool,
+}
+
+#[derive(Serialize)]
+struct QuotaProvidersResponse {
+    providers: Vec<String>,
 }
 
 #[tauri::command]
@@ -1096,6 +1104,8 @@ async fn run_http_server(
             "/api/openchamber/models-metadata",
             get(models_metadata_handler),
         )
+        .route("/api/quota/providers", get(quota_providers_handler))
+        .route("/api/quota/{providerId}", get(quota_provider_handler))
         .route("/api/opencode/directory", post(change_directory_handler))
         .route("/api", any(proxy_to_opencode))
         .route("/api/{*rest}", any(proxy_to_opencode))
@@ -1175,6 +1185,37 @@ async fn models_metadata_handler(
     }
 
     Ok(Json(payload))
+}
+
+async fn quota_providers_handler(State(_state): State<ServerState>) -> Response {
+    match quota_providers::list_configured_quota_providers().await {
+        Ok(providers) => json_response(
+            StatusCode::OK,
+            QuotaProvidersResponse { providers },
+        ),
+        Err(err) => {
+            error!("[desktop:quota] Failed to list quota providers: {}", err);
+            config_error_response(StatusCode::INTERNAL_SERVER_ERROR, err.to_string())
+        }
+    }
+}
+
+async fn quota_provider_handler(
+    State(state): State<ServerState>,
+    Path(provider_id): Path<String>,
+) -> Response {
+    let trimmed = provider_id.trim();
+    if trimmed.is_empty() {
+        return config_error_response(StatusCode::BAD_REQUEST, "Provider ID is required");
+    }
+
+    match quota_providers::fetch_quota_for_provider(&state.client, trimmed).await {
+        Ok(result) => json_response(StatusCode::OK, result),
+        Err(err) => {
+            error!("[desktop:quota] Failed to fetch quota: {}", err);
+            config_error_response(StatusCode::INTERNAL_SERVER_ERROR, err.to_string())
+        }
+    }
 }
 
 #[derive(Deserialize)]
@@ -2059,6 +2100,14 @@ async fn handle_config_routes(
     method: Method,
     mut req: Request,
 ) -> Result<Response, StatusCode> {
+    if path == "/api/config/themes" && method == Method::GET {
+        let themes = read_custom_themes_from_disk().await;
+        return Ok(json_response(
+            StatusCode::OK,
+            serde_json::json!({ "themes": themes }),
+        ));
+    }
+
     if let Some(name) = path.strip_prefix("/api/config/agents/") {
         let trimmed = name.trim();
         if trimmed.is_empty() {
@@ -2564,6 +2613,7 @@ async fn proxy_to_opencode(
     let is_desktop_config_route = origin_path.starts_with("/api/config/agents/")
         || origin_path.starts_with("/api/config/commands/")
         || origin_path.starts_with("/api/config/skills")
+        || origin_path == "/api/config/themes"
         || origin_path == "/api/config/reload"
         || is_provider_auth_delete
         || is_provider_source_get;
@@ -2723,4 +2773,233 @@ impl SettingsStore {
             .map(expand_tilde_path);
         Ok(candidate)
     }
+}
+
+fn openchamber_user_config_root() -> Option<PathBuf> {
+    let home = dirs::home_dir()?;
+    Some(home.join(".config").join("openchamber"))
+}
+
+fn openchamber_themes_dir() -> Option<PathBuf> {
+    openchamber_user_config_root().map(|root| root.join("themes"))
+}
+
+fn value_non_empty_string(value: &Value) -> Option<String> {
+    value
+        .as_str()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string())
+}
+
+fn get_nested<'a>(value: &'a Value, path: &[&str]) -> Option<&'a Value> {
+    let mut current = value;
+    for key in path {
+        current = current.get(*key)?;
+    }
+    Some(current)
+}
+
+fn has_required_theme_fields(theme: &Value) -> bool {
+    let required_paths: [&[&str]; 46] = [
+        &["metadata", "id"],
+        &["metadata", "name"],
+        &["metadata", "variant"],
+        &["colors", "primary", "base"],
+        &["colors", "primary", "foreground"],
+        &["colors", "surface", "background"],
+        &["colors", "surface", "foreground"],
+        &["colors", "surface", "muted"],
+        &["colors", "surface", "mutedForeground"],
+        &["colors", "surface", "elevated"],
+        &["colors", "surface", "elevatedForeground"],
+        &["colors", "surface", "subtle"],
+        &["colors", "interactive", "border"],
+        &["colors", "interactive", "selection"],
+        &["colors", "interactive", "selectionForeground"],
+        &["colors", "interactive", "focusRing"],
+        &["colors", "interactive", "hover"],
+        &["colors", "status", "error"],
+        &["colors", "status", "errorForeground"],
+        &["colors", "status", "errorBackground"],
+        &["colors", "status", "errorBorder"],
+        &["colors", "status", "warning"],
+        &["colors", "status", "warningForeground"],
+        &["colors", "status", "warningBackground"],
+        &["colors", "status", "warningBorder"],
+        &["colors", "status", "success"],
+        &["colors", "status", "successForeground"],
+        &["colors", "status", "successBackground"],
+        &["colors", "status", "successBorder"],
+        &["colors", "status", "info"],
+        &["colors", "status", "infoForeground"],
+        &["colors", "status", "infoBackground"],
+        &["colors", "status", "infoBorder"],
+        &["colors", "syntax", "base", "background"],
+        &["colors", "syntax", "base", "foreground"],
+        &["colors", "syntax", "base", "keyword"],
+        &["colors", "syntax", "base", "string"],
+        &["colors", "syntax", "base", "number"],
+        &["colors", "syntax", "base", "function"],
+        &["colors", "syntax", "base", "variable"],
+        &["colors", "syntax", "base", "type"],
+        &["colors", "syntax", "base", "comment"],
+        &["colors", "syntax", "base", "operator"],
+        &["colors", "syntax", "highlights", "diffAdded"],
+        &["colors", "syntax", "highlights", "diffRemoved"],
+        &["colors", "syntax", "highlights", "lineNumber"],
+    ];
+
+    for path in required_paths {
+        let Some(value) = get_nested(theme, path) else {
+            return false;
+        };
+        if value_non_empty_string(value).is_none() {
+            return false;
+        }
+    }
+
+    let variant = get_nested(theme, &["metadata", "variant"])
+        .and_then(value_non_empty_string)
+        .unwrap_or_default();
+    if variant != "light" && variant != "dark" {
+        return false;
+    }
+
+    true
+}
+
+fn normalize_theme_json(mut theme: Value) -> Option<Value> {
+    if !theme.is_object() {
+        return None;
+    }
+
+    if !has_required_theme_fields(&theme) {
+        return None;
+    }
+
+    let id = get_nested(&theme, &["metadata", "id"]).and_then(value_non_empty_string)?;
+    let name = get_nested(&theme, &["metadata", "name"]).and_then(value_non_empty_string)?;
+    let variant = get_nested(&theme, &["metadata", "variant"]).and_then(value_non_empty_string)?;
+
+    // Ensure metadata exists and is an object.
+    let metadata = theme
+        .get_mut("metadata")
+        .and_then(|v| v.as_object_mut())?;
+
+    metadata.insert("id".to_string(), Value::String(id.trim().to_string()));
+    metadata.insert("name".to_string(), Value::String(name.trim().to_string()));
+    metadata.insert("variant".to_string(), Value::String(variant));
+
+    if !metadata
+        .get("description")
+        .and_then(|v| v.as_str())
+        .is_some()
+    {
+        metadata.insert("description".to_string(), Value::String("".to_string()));
+    }
+
+    let version_ok = metadata
+        .get("version")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .is_some();
+    if !version_ok {
+        metadata.insert("version".to_string(), Value::String("1.0.0".to_string()));
+    }
+
+    if let Some(tags_value) = metadata.get_mut("tags") {
+        if let Some(tags) = tags_value.as_array_mut() {
+            tags.retain(|tag| tag.as_str().map(str::trim).filter(|s| !s.is_empty()).is_some());
+        } else {
+            *tags_value = Value::Array(vec![]);
+        }
+    } else {
+        metadata.insert("tags".to_string(), Value::Array(vec![]));
+    }
+
+    Some(theme)
+}
+
+async fn read_custom_themes_from_disk() -> Vec<Value> {
+    let Some(dir) = openchamber_themes_dir() else {
+        return vec![];
+    };
+
+    let mut results: Vec<Value> = vec![];
+    let mut seen_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+    let mut entries = match fs::read_dir(&dir).await {
+        Ok(entries) => entries,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return vec![],
+        Err(err) => {
+            warn!("[desktop:themes] Failed to list themes dir {:?}: {}", dir, err);
+            return vec![];
+        }
+    };
+
+    while let Ok(Some(entry)) = entries.next_entry().await {
+        let path = entry.path();
+        let is_json = path
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .map(|ext| ext.eq_ignore_ascii_case("json"))
+            .unwrap_or(false);
+        if !is_json {
+            continue;
+        }
+
+        let metadata = match entry.metadata().await {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        if !metadata.is_file() {
+            continue;
+        }
+        if metadata.len() > MAX_THEME_JSON_BYTES {
+            warn!(
+                "[desktop:themes] Skip {:?}: too large ({} bytes)",
+                path,
+                metadata.len()
+            );
+            continue;
+        }
+
+        let bytes = match fs::read(&path).await {
+            Ok(bytes) => bytes,
+            Err(err) => {
+                warn!("[desktop:themes] Failed to read {:?}: {}", path, err);
+                continue;
+            }
+        };
+
+        let parsed: Value = match serde_json::from_slice(&bytes) {
+            Ok(v) => v,
+            Err(err) => {
+                warn!("[desktop:themes] Invalid JSON {:?}: {}", path, err);
+                continue;
+            }
+        };
+
+        let normalized = match normalize_theme_json(parsed) {
+            Some(v) => v,
+            None => {
+                warn!("[desktop:themes] Invalid theme JSON {:?}", path);
+                continue;
+            }
+        };
+
+        let id = get_nested(&normalized, &["metadata", "id"])
+            .and_then(value_non_empty_string)
+            .unwrap_or_default();
+        if id.is_empty() || seen_ids.contains(&id) {
+            continue;
+        }
+        seen_ids.insert(id);
+
+        results.push(normalized);
+    }
+
+    results
 }

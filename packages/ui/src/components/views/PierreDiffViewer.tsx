@@ -1,22 +1,29 @@
 import React, { useMemo, useRef, useState, useCallback, useEffect } from 'react';
 import { createPortal } from 'react-dom';
-import { FileDiff } from '@pierre/diffs/react';
-import { parseDiffFromFile, type FileContents, type FileDiffMetadata, type SelectedLineRange } from '@pierre/diffs';
-import { RiSendPlane2Line } from '@remixicon/react';
+import { FileDiff as PierreFileDiff, type FileContents, type FileDiffOptions, type SelectedLineRange } from '@pierre/diffs';
+import { RiMoreLine, RiDeleteBinLine } from '@remixicon/react';
 
 import { useOptionalThemeSystem } from '@/contexts/useThemeSystem';
 import { ScrollableOverlay } from '@/components/ui/ScrollableOverlay';
-import { ensureFlexokiThemesRegistered } from '@/lib/shiki/registerFlexokiThemes';
-import { flexokiThemeNames } from '@/lib/shiki/flexokiThemes';
+import { useWorkerPool } from '@/contexts/DiffWorkerProvider';
+import { ensurePierreThemeRegistered, getResolvedShikiTheme } from '@/lib/shiki/appThemeRegistry';
+import { getDefaultTheme } from '@/lib/theme/themes';
 
 import { toast } from '@/components/ui';
 import { Textarea } from '@/components/ui/textarea';
+import { Button } from '@/components/ui/button';
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuTrigger,
+} from '@/components/ui/dropdown-menu';
 import { useSessionStore } from '@/stores/useSessionStore';
-import { useConfigStore } from '@/stores/useConfigStore';
-import { useContextStore } from '@/stores/contextStore';
 import { useUIStore } from '@/stores/useUIStore';
 import { useDeviceInfo } from '@/lib/device';
 import { cn, getModifierLabel } from '@/lib/utils';
+import { useInlineCommentDraftStore } from '@/stores/useInlineCommentDraftStore';
+import { useThemeSystem } from '@/contexts/useThemeSystem';
 
 
 interface PierreDiffViewerProps {
@@ -52,59 +59,67 @@ const WEBKIT_SCROLL_FIX_CSS = `
   [data-code] {
     -webkit-overflow-scrolling: touch;
   }
-  
+
   /* Mobile touch selection support */
   [data-line-number] {
     touch-action: manipulation;
     -webkit-tap-highlight-color: transparent;
     cursor: pointer;
   }
-  
+
   /* Ensure interactive line numbers work on touch */
   pre[data-interactive-line-numbers] [data-line-number] {
     touch-action: manipulation;
   }
   /* Reduce hunk separator height */
-  [data-separator-content] {
-    height: 24px !important;
-  }
-  [data-expand-button] {
-    height: 24px !important;
-    width: 24px !important;
-  }
-  [data-separator-multi-button] {
-    row-gap: 0 !important;
-  }
-  [data-expand-up] {
-    height: 12px !important;
-    min-height: 12px !important;
-    max-height: 12px !important;
-    margin: 0 !important;
-    margin-top: 3px !important;
-    padding: 0 !important;
-    border-radius: 4px 4px 0 0 !important;
-  }
-  [data-expand-down] {
-    height: 12px !important;
-    min-height: 12px !important;
-    max-height: 12px !important;
-    margin: 0 !important;
-    margin-top: -3px !important;
-    padding: 0 !important;
-    border-radius: 0 0 4px 4px !important;
-  }
+  // [data-separator-content] {
+  //   height: 24px !important;
+  // }
+  // [data-expand-button] {
+  //   height: 24px !important;
+  //   width: 24px !important;
+  // }
+  // [data-separator-multi-button] {
+  //   row-gap: 0 !important;
+  // }
+  // [data-expand-up] {
+  //   height: 12px !important;
+  //   min-height: 12px !important;
+  //   max-height: 12px !important;
+  //   margin: 0 !important;
+  //   margin-top: 3px !important;
+  //   padding: 0 !important;
+  //   border-radius: 4px 4px 0 0 !important;
+  // }
+  // [data-expand-down] {
+  //   height: 12px !important;
+  //   min-height: 12px !important;
+  //   max-height: 12px !important;
+  //   margin: 0 !important;
+  //   margin-top: -3px !important;
+  //   padding: 0 !important;
+  //   border-radius: 0 0 4px 4px !important;
+  // }
 `;
 
 // Fast cache key - use length + samples instead of full hash
-function getCacheKey(fileName: string, original: string, modified: string): string {
-  // Sample a few characters instead of hashing entire content
-  const sampleOriginal = original.length > 100
-    ? `${original.slice(0, 50)}${original.slice(-50)}`
-    : original;
-  const sampleModified = modified.length > 100
-    ? `${modified.slice(0, 50)}${modified.slice(-50)}`
-    : modified;
-  return `${fileName}:${original.length}:${modified.length}:${sampleOriginal.length}:${sampleModified.length}`;
+function fnv1a32(input: string): string {
+  // Fast + stable across runtimes; good enough for cache keys.
+  let hash = 0x811c9dc5;
+  for (let i = 0; i < input.length; i += 1) {
+    hash ^= input.charCodeAt(i);
+    // hash *= 16777619 (but keep 32-bit)
+    hash = (hash + ((hash << 1) + (hash << 4) + (hash << 7) + (hash << 8) + (hash << 24))) >>> 0;
+  }
+  return hash.toString(16);
+}
+
+function makeContentCacheKey(contents: string): string {
+  // Avoid hashing full file; sample head+tail.
+  const sample = contents.length > 400
+    ? `${contents.slice(0, 200)}${contents.slice(-200)}`
+    : contents;
+  return `${contents.length}:${fnv1a32(sample)}`;
 }
 
 const extractSelectedCode = (original: string, modified: string, range: SelectedLineRange): string => {
@@ -112,14 +127,20 @@ const extractSelectedCode = (original: string, modified: string, range: Selected
   const isOriginal = range.side === 'deletions';
   const content = isOriginal ? original : modified;
   const lines = content.split('\n');
-  
+
   // Ensure bounds
   const startLine = Math.max(1, range.start);
   const endLine = Math.min(lines.length, range.end);
-  
+
   if (startLine > endLine) return '';
-  
+
   return lines.slice(startLine - 1, endLine).join('\n');
+};
+
+const isSameSelection = (left: SelectedLineRange | null, right: SelectedLineRange | null): boolean => {
+  if (left === right) return true;
+  if (!left || !right) return false;
+  return left.start === right.start && left.end === right.end && left.side === right.side;
 };
 
 export const PierreDiffViewer: React.FC<PierreDiffViewerProps> = ({
@@ -133,60 +154,119 @@ export const PierreDiffViewer: React.FC<PierreDiffViewerProps> = ({
 }) => {
   const { isMobile } = useDeviceInfo();
   const { inputBarOffset, isKeyboardOpen } = useUIStore();
-  
+
   const themeSystem = useOptionalThemeSystem();
   const isDark = themeSystem?.currentTheme?.metadata?.variant === 'dark';
 
-  const setActiveMainTab = useUIStore(state => state.setActiveMainTab);
+  const fallbackLight = getDefaultTheme(false);
+  const fallbackDark = getDefaultTheme(true);
+
+  const lightThemeId = themeSystem?.lightThemeId ?? fallbackLight.metadata.id;
+  const darkThemeId = themeSystem?.darkThemeId ?? fallbackDark.metadata.id;
+
+  const lightTheme =
+    themeSystem?.availableThemes.find((theme) => theme.metadata.id === lightThemeId) ??
+    fallbackLight;
+  const darkTheme =
+    themeSystem?.availableThemes.find((theme) => theme.metadata.id === darkThemeId) ??
+    fallbackDark;
 
   const [selection, setSelection] = useState<SelectedLineRange | null>(null);
   const [commentText, setCommentText] = useState('');
   const commentContainerRef = useRef<HTMLDivElement>(null);
-  
-  // Calculate initial center synchronously to avoid flicker
-  const getMainContentCenter = useCallback(() => {
-    if (isMobile) return '50%';
+
+  // Refs to prevent infinite loops when syncing selection with diff instance
+  const selectionRef = useRef<SelectedLineRange | null>(null);
+  const isApplyingSelectionRef = useRef(false);
+  const lastAppliedSelectionRef = useRef<SelectedLineRange | null>(null);
+
+  // Keep selectionRef in sync with state
+  useEffect(() => {
+    selectionRef.current = selection;
+  }, [selection]);
+
+  // Calculate initial center and width synchronously to avoid flicker
+  const getMainContentMetrics = useCallback(() => {
+    if (isMobile) return { center: '50%', width: '100vw' };
     const mainContent = document.querySelector('main.flex-1');
     if (mainContent) {
       const rect = mainContent.getBoundingClientRect();
-      return `${rect.left + rect.width / 2}px`;
+      return {
+        center: `${rect.left + rect.width / 2}px`,
+        width: `${rect.width}px`
+      };
     }
-    return '50%';
+    return { center: '50%', width: '100vw' };
   }, [isMobile]);
-  
-  const [mainContentCenter, setMainContentCenter] = useState<string>(getMainContentCenter);
-  
-  const sendMessage = useSessionStore(state => state.sendMessage);
+
+  const [mainContentMetrics, setMainContentMetrics] = useState(getMainContentMetrics);
+  const mainContentCenter = mainContentMetrics.center;
+  const mainContentWidth = mainContentMetrics.width;
+
   const currentSessionId = useSessionStore(state => state.currentSessionId);
-  const { currentProviderId, currentModelId, currentAgentName, currentVariant } = useConfigStore();
-  const getSessionAgentSelection = useContextStore(state => state.getSessionAgentSelection);
-  const getAgentModelForSession = useContextStore(state => state.getAgentModelForSession);
-  const getAgentModelVariantForSession = useContextStore(state => state.getAgentModelVariantForSession);
-  
-  // Update main content center on resize
+  const newSessionDraftOpen = useSessionStore(state => state.newSessionDraft?.open);
+
+  // Inline comment drafts
+  const addDraft = useInlineCommentDraftStore(state => state.addDraft);
+  const removeDraft = useInlineCommentDraftStore(state => state.removeDraft);
+  const allDrafts = useInlineCommentDraftStore(state => state.drafts);
+
+  // Filter drafts locally to avoid returning new array refs from selector
+  const drafts = useMemo(() => {
+    const sessionKey = currentSessionId ?? (newSessionDraftOpen ? 'draft' : '');
+    if (!sessionKey) return [];
+    return (allDrafts[sessionKey] ?? []).filter(
+      d => d.source === 'diff' && d.fileLabel === fileName
+    );
+  }, [currentSessionId, newSessionDraftOpen, fileName, allDrafts]);
+
+  const { currentTheme } = useThemeSystem();
+
+  // Get session key for drafts
+  const getSessionKey = useCallback(() => {
+    return currentSessionId ?? (newSessionDraftOpen ? 'draft' : null);
+  }, [currentSessionId, newSessionDraftOpen]);
+
+  // Update main content metrics on resize
   useEffect(() => {
     if (isMobile) return;
-    
-    const updateCenter = () => {
-      setMainContentCenter(getMainContentCenter());
-    };
-    
-    window.addEventListener('resize', updateCenter);
-    return () => window.removeEventListener('resize', updateCenter);
-  }, [isMobile, getMainContentCenter]);
 
+    const updateMetrics = () => {
+      setMainContentMetrics(getMainContentMetrics());
+    };
+
+    window.addEventListener('resize', updateMetrics);
+    return () => window.removeEventListener('resize', updateMetrics);
+  }, [isMobile, getMainContentMetrics]);
+
+  // Stable handler that uses refs to avoid recreating on selection changes
   const handleSelectionChange = useCallback((range: SelectedLineRange | null) => {
+    // Ignore callbacks while we're programmatically applying selection
+    if (isApplyingSelectionRef.current) {
+      return;
+    }
+
+    const lastApplied = lastAppliedSelectionRef.current;
+    if (isSameSelection(range, lastApplied)) {
+      return;
+    }
+
+    const currentSelection = selectionRef.current;
+    if (isSameSelection(range, currentSelection)) {
+      return;
+    }
+
     // On mobile: implement "tap to extend" behavior
     // If user taps a new single line while we have an existing selection, extend the range
-    if (isMobile && range && selection && range.start === range.end) {
+    if (isMobile && range && currentSelection && range.start === range.end) {
       const tappedLine = range.start;
-      const existingStart = selection.start;
-      const existingEnd = selection.end;
-      
+      const existingStart = currentSelection.start;
+      const existingEnd = currentSelection.end;
+
       // Extend the selection to include the tapped line
       const newStart = Math.min(existingStart, existingEnd, tappedLine);
       const newEnd = Math.max(existingStart, existingEnd, tappedLine);
-      
+
       // Only extend if tapping outside current selection
       if (tappedLine < existingStart || tappedLine > existingEnd) {
         setSelection({
@@ -197,26 +277,26 @@ export const PierreDiffViewer: React.FC<PierreDiffViewerProps> = ({
         return;
       }
     }
-    
+
     setSelection(range);
     if (!range) {
       setCommentText('');
     }
-  }, [isMobile, selection]);
+  }, [isMobile]);
 
   // Dismiss selection when clicking outside line numbers (desktop behavior)
   useEffect(() => {
     if (!selection) return;
-    
+
     const handleClickOutside = (e: MouseEvent) => {
       const target = e.target as HTMLElement;
-      
+
       // Check if click is inside the comment UI portal
       if (commentContainerRef.current?.contains(target)) return;
 
       // Check if click is inside toast (sonner)
       if (target.closest('[data-sonner-toast]') || target.closest('[data-sonner-toaster]')) return;
-      
+
       // Check if click is on a line number (inside shadow DOM)
       const path = e.composedPath();
       const isLineNumber = path.some((el) => {
@@ -225,142 +305,257 @@ export const PierreDiffViewer: React.FC<PierreDiffViewerProps> = ({
         }
         return false;
       });
-      
+
       if (!isLineNumber) {
         setSelection(null);
         setCommentText('');
       }
     };
-    
+
     // Use timeout to avoid immediate dismissal from the same click that selected
     const timeoutId = setTimeout(() => {
       document.addEventListener('click', handleClickOutside);
     }, 100);
-    
+
     return () => {
       clearTimeout(timeoutId);
       document.removeEventListener('click', handleClickOutside);
     };
   }, [selection]);
 
-  const handleSendComment = useCallback(async () => {
-    if (!selection || !commentText.trim()) return;
-    if (!currentSessionId) {
-      toast.error('Select a session to send comment');
-      return;
-    }
-
-    // Get session-specific agent/model/variant with fallback to config values
-    const sessionAgent = getSessionAgentSelection(currentSessionId) || currentAgentName;
-    const sessionModel = sessionAgent ? getAgentModelForSession(currentSessionId, sessionAgent) : null;
-    const effectiveProviderId = sessionModel?.providerId || currentProviderId;
-    const effectiveModelId = sessionModel?.modelId || currentModelId;
-
-    if (!effectiveProviderId || !effectiveModelId) {
-      toast.error('Select a model to send comment');
-      return;
-    }
-
-    const effectiveVariant = sessionAgent && effectiveProviderId && effectiveModelId
-      ? getAgentModelVariantForSession(currentSessionId, sessionAgent, effectiveProviderId, effectiveModelId) ?? currentVariant
-      : currentVariant;
-    
-    const code = extractSelectedCode(original, modified, selection);
-    const startLine = selection.start;
-    const endLine = selection.end;
-    const side = selection.side === 'deletions' ? 'original' : 'modified';
-    
-    const message = `Comment on \`${fileName}\` lines ${startLine}-${endLine} (${side}):\n\`\`\`${language}\n${code}\n\`\`\`\n\n${commentText}`;
-    
-    // Clear state and switch tab immediately for responsive UX
+  const handleCancelComment = useCallback(() => {
     setCommentText('');
     setSelection(null);
-    setActiveMainTab('chat');
-    
-    void sendMessage(
-      message,
-      effectiveProviderId,
-      effectiveModelId,
-      sessionAgent,
-      undefined,
-      undefined,
-      undefined,
-      effectiveVariant
-    ).catch((e) => {
-      console.error('Failed to send comment', e);
-    });
-  }, [selection, commentText, original, modified, fileName, language, sendMessage, currentSessionId, currentProviderId, currentModelId, currentAgentName, currentVariant, setActiveMainTab, getSessionAgentSelection, getAgentModelForSession, getAgentModelVariantForSession]);
+  }, []);
 
-  ensureFlexokiThemesRegistered();
+  const handleSaveComment = useCallback(() => {
+    if (!selection || !commentText.trim()) return;
 
-  // Cache the last computed diff to avoid recomputing on every render
-  const diffCacheRef = useRef<{
-    key: string;
-    fileDiff: FileDiffMetadata;
-  } | null>(null);
-
-  // Pre-parse the diff with cacheKey for worker pool caching
-  const fileDiff = useMemo(() => {
-    const cacheKey = getCacheKey(fileName, original, modified);
-
-    // Return cached diff if inputs haven't changed
-    if (diffCacheRef.current?.key === cacheKey) {
-      return diffCacheRef.current.fileDiff;
+    const sessionKey = getSessionKey();
+    if (!sessionKey) {
+      toast.error('Select a session to save comment');
+      return;
     }
 
-    const oldFile: FileContents = {
-      name: fileName,
-      contents: original,
-      lang: language as FileContents['lang'],
-      cacheKey: `old-${cacheKey}`,
+    const code = extractSelectedCode(original, modified, selection);
+    const side = selection.side === 'deletions' ? 'original' : 'modified';
+
+    addDraft({
+      sessionKey,
+      source: 'diff',
+      fileLabel: fileName,
+      startLine: selection.start,
+      endLine: selection.end,
+      side,
+      code,
+      language,
+      text: commentText.trim(),
+    });
+
+    // Clear selection and comment text
+    setCommentText('');
+    setSelection(null);
+
+    toast.success('Comment saved');
+  }, [selection, commentText, original, modified, fileName, language, addDraft, getSessionKey]);
+
+  ensurePierreThemeRegistered(lightTheme);
+  ensurePierreThemeRegistered(darkTheme);
+
+  const diffThemeKey = `${lightTheme.metadata.id}:${darkTheme.metadata.id}:${isDark ? 'dark' : 'light'}`;
+
+  const diffRootRef = useRef<HTMLDivElement | null>(null);
+  const diffContainerRef = useRef<HTMLDivElement | null>(null);
+  const diffInstanceRef = useRef<PierreFileDiff<unknown> | null>(null);
+  const workerPool = useWorkerPool();
+
+  const lightResolvedTheme = useMemo(() => getResolvedShikiTheme(lightTheme), [lightTheme]);
+  const darkResolvedTheme = useMemo(() => getResolvedShikiTheme(darkTheme), [darkTheme]);
+
+  // Fast-path: update base diff theme vars immediately.
+  // Without this, already-mounted diffs can keep old bg/bars until async highlight completes.
+  React.useLayoutEffect(() => {
+    const root = diffRootRef.current;
+    if (!root) return;
+
+    const container = root.querySelector('diffs-container') as HTMLElement | null;
+    if (!container) return;
+
+    const currentResolved = isDark ? darkResolvedTheme : lightResolvedTheme;
+
+    const getColor = (
+      resolved: typeof currentResolved,
+      key: string,
+    ): string | undefined => {
+      const colors = resolved.colors as Record<string, string> | undefined;
+      return colors?.[key];
     };
 
-    const newFile: FileContents = {
-      name: fileName,
-      contents: modified,
-      lang: language as FileContents['lang'],
-      cacheKey: `new-${cacheKey}`,
-    };
+    const lightAdd = getColor(lightResolvedTheme, 'terminal.ansiGreen');
+    const lightDel = getColor(lightResolvedTheme, 'terminal.ansiRed');
+    const lightMod = getColor(lightResolvedTheme, 'terminal.ansiBlue');
 
-    const diff = parseDiffFromFile(oldFile, newFile);
+    const darkAdd = getColor(darkResolvedTheme, 'terminal.ansiGreen');
+    const darkDel = getColor(darkResolvedTheme, 'terminal.ansiRed');
+    const darkMod = getColor(darkResolvedTheme, 'terminal.ansiBlue');
 
-    // Cache the result
-    diffCacheRef.current = { key: cacheKey, fileDiff: diff };
+    // Apply on host; vars inherit into shadow root.
+    container.style.setProperty('--shiki-light', lightResolvedTheme.fg);
+    container.style.setProperty('--shiki-light-bg', lightResolvedTheme.bg);
+    if (lightAdd) container.style.setProperty('--shiki-light-addition-color', lightAdd);
+    if (lightDel) container.style.setProperty('--shiki-light-deletion-color', lightDel);
+    if (lightMod) container.style.setProperty('--shiki-light-modified-color', lightMod);
 
-    return diff;
-  }, [fileName, original, modified, language]);
+    container.style.setProperty('--shiki-dark', darkResolvedTheme.fg);
+    container.style.setProperty('--shiki-dark-bg', darkResolvedTheme.bg);
+    if (darkAdd) container.style.setProperty('--shiki-dark-addition-color', darkAdd);
+    if (darkDel) container.style.setProperty('--shiki-dark-deletion-color', darkDel);
+    if (darkMod) container.style.setProperty('--shiki-dark-modified-color', darkMod);
+
+    container.style.setProperty('--diffs-bg', currentResolved.bg);
+    container.style.setProperty('--diffs-fg', currentResolved.fg);
+
+    const currentAdd = isDark ? darkAdd : lightAdd;
+    const currentDel = isDark ? darkDel : lightDel;
+    const currentMod = isDark ? darkMod : lightMod;
+    if (currentAdd) container.style.setProperty('--diffs-addition-color-override', currentAdd);
+    if (currentDel) container.style.setProperty('--diffs-deletion-color-override', currentDel);
+    if (currentMod) container.style.setProperty('--diffs-modified-color-override', currentMod);
+
+    // Pierre also inlines theme styles on <pre> inside shadow root.
+    // Patch it too so already-expanded diffs switch instantly.
+    const pre = container.shadowRoot?.querySelector('pre') as HTMLPreElement | null;
+    if (pre) {
+      pre.style.setProperty('--shiki-light', lightResolvedTheme.fg);
+      pre.style.setProperty('--shiki-light-bg', lightResolvedTheme.bg);
+      if (lightAdd) pre.style.setProperty('--shiki-light-addition-color', lightAdd);
+      if (lightDel) pre.style.setProperty('--shiki-light-deletion-color', lightDel);
+      if (lightMod) pre.style.setProperty('--shiki-light-modified-color', lightMod);
+
+      pre.style.setProperty('--shiki-dark', darkResolvedTheme.fg);
+      pre.style.setProperty('--shiki-dark-bg', darkResolvedTheme.bg);
+      if (darkAdd) pre.style.setProperty('--shiki-dark-addition-color', darkAdd);
+      if (darkDel) pre.style.setProperty('--shiki-dark-deletion-color', darkDel);
+      if (darkMod) pre.style.setProperty('--shiki-dark-modified-color', darkMod);
+
+      pre.style.setProperty('--diffs-bg', currentResolved.bg);
+      pre.style.setProperty('--diffs-fg', currentResolved.fg);
+      if (currentAdd) pre.style.setProperty('--diffs-addition-color-override', currentAdd);
+      if (currentDel) pre.style.setProperty('--diffs-deletion-color-override', currentDel);
+      if (currentMod) pre.style.setProperty('--diffs-modified-color-override', currentMod);
+    }
+  }, [darkResolvedTheme, diffThemeKey, isDark, lightResolvedTheme]);
 
   const options = useMemo(() => ({
     theme: {
-      dark: flexokiThemeNames.dark,
-      light: flexokiThemeNames.light,
+      dark: darkTheme.metadata.id,
+      light: lightTheme.metadata.id,
     },
     themeType: isDark ? ('dark' as const) : ('light' as const),
     diffStyle: renderSideBySide ? ('split' as const) : ('unified' as const),
     diffIndicators: 'none' as const,
     hunkSeparators: 'line-info' as const,
-    lineDiffType: 'word-alt' as const,
+    // Perf: disable intra-line diff (word-level) globally.
+    lineDiffType: 'none' as const,
     overflow: wrapLines ? ('wrap' as const) : ('scroll' as const),
     disableFileHeader: true,
     enableLineSelection: true,
     enableHoverUtility: false,
     onLineSelected: handleSelectionChange,
     unsafeCSS: WEBKIT_SCROLL_FIX_CSS,
-  }), [isDark, renderSideBySide, wrapLines, handleSelectionChange]);
- 
+  }), [darkTheme.metadata.id, isDark, lightTheme.metadata.id, renderSideBySide, wrapLines, handleSelectionChange]);
+
+  // Imperative render (like upstream OpenCode): avoids `parseDiffFromFile` on main thread.
+  useEffect(() => {
+    if (typeof window === 'undefined') return;
+
+    const container = diffContainerRef.current;
+    if (!container) return;
+    if (!workerPool) return;
+
+    // Dispose previous instance
+    diffInstanceRef.current?.cleanUp();
+    diffInstanceRef.current = null;
+    container.innerHTML = '';
+
+    const instance = new PierreFileDiff(options as unknown as FileDiffOptions<unknown>, workerPool);
+    diffInstanceRef.current = instance;
+    lastAppliedSelectionRef.current = null;
+
+    const oldFile: FileContents = {
+      name: fileName,
+      contents: original,
+      lang: language as FileContents['lang'],
+      cacheKey: `old:${diffThemeKey}:${fileName}:${makeContentCacheKey(original)}`,
+    };
+    const newFile: FileContents = {
+      name: fileName,
+      contents: modified,
+      lang: language as FileContents['lang'],
+      cacheKey: `new:${diffThemeKey}:${fileName}:${makeContentCacheKey(modified)}`,
+    };
+
+    instance.render({
+      oldFile,
+      newFile,
+      lineAnnotations: [],
+      containerWrapper: container,
+    });
+
+    return () => {
+      instance.cleanUp();
+      if (diffInstanceRef.current === instance) {
+        diffInstanceRef.current = null;
+      }
+      container.innerHTML = '';
+    };
+  }, [diffThemeKey, fileName, language, modified, options, original, workerPool]);
+
+  useEffect(() => {
+    const instance = diffInstanceRef.current;
+    if (!instance) return;
+
+    // Only push selection to the diff when clearing.
+    // User-driven selections already originate from the diff itself.
+    if (selection !== null) {
+      return;
+    }
+
+    // Guard against feedback loops and redundant updates
+    const lastApplied = lastAppliedSelectionRef.current;
+    if (isSameSelection(selection, lastApplied)) {
+      return;
+    }
+
+    try {
+      isApplyingSelectionRef.current = true;
+      instance.setSelectedLines(selection);
+      lastAppliedSelectionRef.current = selection;
+    } catch {
+      // ignore
+    } finally {
+      isApplyingSelectionRef.current = false;
+    }
+  }, [selection]);
+
   if (typeof window === 'undefined') {
     return null;
   }
- 
+
   // Extracted Comment Interface Content for reuse in Portal or In-Flow
   const renderCommentContent = () => {
     if (!selection) return null;
     return (
-      <div 
+      <div
         className="flex flex-col items-center gap-2 px-4"
-        style={{ width: 'min(100vw - 1rem, 42rem)' }}
+        style={{ width: `min(calc(${mainContentWidth} - 2rem), 42rem)` }}
       >
-        <div className="w-full rounded-xl border bg-sidebar flex flex-col relative shadow-lg" style={{ borderColor: 'var(--primary)' }}>
+        <div
+          className="w-full rounded-xl flex flex-col relative shadow-lg border border-border/80 focus-within:border-primary/70 focus-within:ring-1 focus-within:ring-primary/50"
+          style={{
+            backgroundColor: themeSystem?.currentTheme?.colors?.surface?.subtle,
+          }}
+        >
           {/* Textarea - auto-grows from 1 line to max 5 lines */}
           <Textarea
             value={commentText}
@@ -374,59 +569,122 @@ export const PierreDiffViewer: React.FC<PierreDiffViewerProps> = ({
               textarea.style.height = `${Math.min(textarea.scrollHeight, maxHeight)}px`;
             }}
             placeholder="Type your comment..."
-            className="min-h-[28px] max-h-[108px] resize-none border-0 px-3 pt-2 pb-1 shadow-none rounded-none appearance-none focus:shadow-none focus-visible:shadow-none focus-visible:border-transparent focus-visible:ring-0 focus-visible:ring-transparent hover:border-transparent bg-transparent dark:bg-transparent focus-visible:outline-none overflow-y-auto"
+            outerClassName="focus-within:ring-0"
+            className="min-h-[28px] max-h-[108px] resize-none border-0 px-3 pt-2 pb-1 rounded-none appearance-none hover:border-transparent bg-transparent dark:bg-transparent overflow-y-auto focus:ring-0 focus:shadow-none"
             autoFocus={!isMobile}
             rows={1}
             onKeyDown={(e) => {
               if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) {
                 e.preventDefault();
-                handleSendComment();
+                handleSaveComment();
               }
               if (e.key === 'Escape') {
                 e.preventDefault();
-                setSelection(null);
-                setCommentText('');
+                handleCancelComment();
               }
             }}
           />
-          {/* Footer */}
-          <div className="px-2.5 py-1 flex items-center justify-between gap-x-1.5">
+          {/* Footer with Cancel and Comment buttons */}
+          <div className="px-2.5 py-1 flex items-center justify-between gap-x-2">
             <span className="text-xs text-muted-foreground">
               {fileName.split('/').pop()}:{selection.start}-{selection.end}
             </span>
-            <div className="flex items-center gap-x-1.5">
+            <div className="flex items-center gap-x-2">
               {!isMobile && (
                 <span className="text-xs text-muted-foreground">
                   {getModifierLabel()}+⏎
                 </span>
               )}
-              <button
+              <Button
                 type="button"
-                onTouchEnd={(e) => {
-                  // On mobile, handle send via touchend to avoid race with selection clearing
-                  if (commentText.trim()) {
-                    e.preventDefault();
-                    handleSendComment();
-                  }
-                }}
-                onClick={() => {
-                  // Desktop click handler
-                  if (!isMobile) {
-                    handleSendComment();
-                  }
-                }}
-                disabled={!commentText.trim()}
-                className={cn(
-                  "h-7 w-7 flex items-center justify-center text-muted-foreground transition-none outline-none focus:outline-none flex-shrink-0",
-                  commentText.trim() ? "text-primary hover:text-primary" : "opacity-30"
-                )}
-                aria-label="Send comment"
+                variant="outline"
+                size="sm"
+                onClick={handleCancelComment}
+                className="h-7 px-2 text-xs"
               >
-                <RiSendPlane2Line className="h-[18px] w-[18px]" />
-              </button>
+                Cancel
+              </Button>
+              <Button
+                type="button"
+                variant="default"
+                size="sm"
+                onClick={handleSaveComment}
+                disabled={!commentText.trim()}
+                className="h-7 px-2 text-xs"
+                style={{
+                  backgroundColor: currentTheme?.colors?.status?.success,
+                  color: currentTheme?.colors?.status?.successForeground,
+                }}
+              >
+                Comment
+              </Button>
             </div>
           </div>
         </div>
+      </div>
+    );
+  };
+
+  // Render saved comment cards
+  const renderSavedComments = () => {
+    if (drafts.length === 0) return null;
+
+    return (
+      <div className="absolute inset-0 pointer-events-none z-40">
+        {drafts.map(draft => {
+          // Approximate line placement; shadow DOM prevents direct line querying.
+          const lineHeight = 24;
+          const top = (draft.startLine - 1) * lineHeight;
+
+          return (
+            <div
+              key={draft.id}
+              className="absolute pointer-events-auto"
+              style={{
+                top: `${top}px`,
+                right: '8px',
+                maxWidth: '300px',
+              }}
+            >
+              <div
+                className="rounded-lg border p-2 shadow-md"
+                style={{
+                  backgroundColor: currentTheme?.colors?.surface?.elevated,
+                  borderColor: currentTheme?.colors?.interactive?.border,
+                }}
+              >
+                <div className="flex items-start justify-between gap-2">
+                  <div className="flex-1 min-w-0">
+                    <div className="text-xs font-medium text-muted-foreground mb-1">
+                      {draft.fileLabel}:{draft.startLine}-{draft.endLine}
+                      {draft.side && ` (${draft.side})`}
+                    </div>
+                    <div className="text-sm line-clamp-3">{draft.text}</div>
+                  </div>
+                  <DropdownMenu>
+                    <DropdownMenuTrigger asChild>
+                      <button
+                        type="button"
+                        className="flex-shrink-0 p-1 rounded hover:bg-[var(--interactive-hover)] text-muted-foreground"
+                      >
+                        <RiMoreLine className="h-4 w-4" />
+                      </button>
+                    </DropdownMenuTrigger>
+                    <DropdownMenuContent align="end">
+                      <DropdownMenuItem
+                        onClick={() => removeDraft(draft.sessionKey, draft.id)}
+                        className="text-destructive"
+                      >
+                        <RiDeleteBinLine className="h-4 w-4 mr-2" />
+                        Delete comment
+                      </DropdownMenuItem>
+                    </DropdownMenuContent>
+                  </DropdownMenu>
+                </div>
+              </div>
+            </div>
+          );
+        })}
       </div>
     );
   };
@@ -437,7 +695,7 @@ export const PierreDiffViewer: React.FC<PierreDiffViewerProps> = ({
   // If we're in an inline diff ('inline' layout), render via Portal (fixed over content).
   if (layout === 'fill') {
     return (
-      <div 
+      <div
         className={cn("flex flex-col relative", "size-full")}
         style={{
           // Apply keyboard padding to the main container, just like ChatContainer
@@ -450,23 +708,22 @@ export const PierreDiffViewer: React.FC<PierreDiffViewerProps> = ({
             disableHorizontal={false}
             fillContainer={true}
           >
-            <FileDiff
-              fileDiff={fileDiff}
-              options={options}
-              selectedLines={selection}
-            />
+            <div ref={diffRootRef} className="size-full relative">
+              <div ref={diffContainerRef} className="size-full" />
+              {renderSavedComments()}
+            </div>
           </ScrollableOverlay>
         </div>
-        
-        {/* Render Input In-Flow at the bottom */}
+
+        {/* Render Input overlay at the bottom */}
         {selection && (
-          <div 
+          <div
             className={cn(
-              "pointer-events-auto relative pb-2 transition-none z-50 flex justify-center",
+              "pointer-events-auto absolute bottom-0 left-0 right-0 pb-2 transition-none z-50 flex justify-center w-full",
               isMobile && isKeyboardOpen ? "ios-keyboard-safe-area" : "bottom-safe-area"
             )}
             style={{
-              marginBottom: isMobile 
+              marginBottom: isMobile
                 ? (!isKeyboardOpen && inputBarOffset > 0 ? `${inputBarOffset}px` : '16px')
                 : '16px'
             }}
@@ -485,31 +742,28 @@ export const PierreDiffViewer: React.FC<PierreDiffViewerProps> = ({
   // Use simple div with overflow-x-auto to avoid nested ScrollableOverlay issues in Chrome
   return (
     <div className={cn("relative", "w-full")}>
-      <div className="pierre-diff-wrapper w-full overflow-x-auto overflow-y-visible">
-        <FileDiff
-          fileDiff={fileDiff}
-          options={options}
-          selectedLines={selection}
-        />
+      <div ref={diffRootRef} className="pierre-diff-wrapper w-full overflow-x-auto overflow-y-visible relative">
+        <div ref={diffContainerRef} className="w-full" />
+        {renderSavedComments()}
       </div>
-      
+
       {selection && createPortal(
-        <div 
+        <div
           className="fixed inset-0 z-50 flex flex-col justify-end items-start pointer-events-none transition-none transform-gpu"
-          style={{ 
+          style={{
             paddingBottom: isMobile ? 'var(--oc-keyboard-inset, 0px)' : '0px',
             isolation: 'isolate'
           }}
         >
-          <div 
+          <div
             className={cn(
               "pointer-events-auto relative pb-2 transition-none",
               isMobile && isKeyboardOpen ? "ios-keyboard-safe-area" : "bottom-safe-area"
             )}
-            style={{ 
+            style={{
               marginLeft: mainContentCenter,
               transform: 'translateX(-50%)',
-              marginBottom: isMobile 
+              marginBottom: isMobile
                 ? (!isKeyboardOpen && inputBarOffset > 0 ? `${inputBarOffset}px` : '16px')
                 : '16px'
             }}

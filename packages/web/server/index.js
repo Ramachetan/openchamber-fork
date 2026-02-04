@@ -65,6 +65,163 @@ const normalizeDirectoryPath = (value) => {
 };
 
 const OPENCHAMBER_USER_CONFIG_ROOT = path.join(os.homedir(), '.config', 'openchamber');
+const OPENCHAMBER_USER_THEMES_DIR = path.join(OPENCHAMBER_USER_CONFIG_ROOT, 'themes');
+
+const MAX_THEME_JSON_BYTES = 512 * 1024;
+
+const isNonEmptyString = (value) => typeof value === 'string' && value.trim().length > 0;
+
+const isValidThemeColor = (value) => isNonEmptyString(value);
+
+const normalizeThemeJson = (raw) => {
+  if (!raw || typeof raw !== 'object') {
+    return null;
+  }
+
+  const metadata = raw.metadata && typeof raw.metadata === 'object' ? raw.metadata : null;
+  const colors = raw.colors && typeof raw.colors === 'object' ? raw.colors : null;
+  if (!metadata || !colors) {
+    return null;
+  }
+
+  const id = metadata.id;
+  const name = metadata.name;
+  const variant = metadata.variant;
+  if (!isNonEmptyString(id) || !isNonEmptyString(name) || (variant !== 'light' && variant !== 'dark')) {
+    return null;
+  }
+
+  const primary = colors.primary;
+  const surface = colors.surface;
+  const interactive = colors.interactive;
+  const status = colors.status;
+  const syntax = colors.syntax;
+  const syntaxBase = syntax && typeof syntax === 'object' ? syntax.base : null;
+  const syntaxHighlights = syntax && typeof syntax === 'object' ? syntax.highlights : null;
+
+  if (!primary || !surface || !interactive || !status || !syntaxBase || !syntaxHighlights) {
+    return null;
+  }
+
+  // Minimal fields required by CSSVariableGenerator and diff/syntax rendering.
+  const required = [
+    primary.base,
+    primary.foreground,
+    surface.background,
+    surface.foreground,
+    surface.muted,
+    surface.mutedForeground,
+    surface.elevated,
+    surface.elevatedForeground,
+    surface.subtle,
+    interactive.border,
+    interactive.selection,
+    interactive.selectionForeground,
+    interactive.focusRing,
+    interactive.hover,
+    status.error,
+    status.errorForeground,
+    status.errorBackground,
+    status.errorBorder,
+    status.warning,
+    status.warningForeground,
+    status.warningBackground,
+    status.warningBorder,
+    status.success,
+    status.successForeground,
+    status.successBackground,
+    status.successBorder,
+    status.info,
+    status.infoForeground,
+    status.infoBackground,
+    status.infoBorder,
+    syntaxBase.background,
+    syntaxBase.foreground,
+    syntaxBase.keyword,
+    syntaxBase.string,
+    syntaxBase.number,
+    syntaxBase.function,
+    syntaxBase.variable,
+    syntaxBase.type,
+    syntaxBase.comment,
+    syntaxBase.operator,
+    syntaxHighlights.diffAdded,
+    syntaxHighlights.diffRemoved,
+    syntaxHighlights.lineNumber,
+  ];
+
+  if (!required.every(isValidThemeColor)) {
+    return null;
+  }
+
+  const tags = Array.isArray(metadata.tags)
+    ? metadata.tags.filter((tag) => typeof tag === 'string' && tag.trim().length > 0)
+    : [];
+
+  return {
+    ...raw,
+    metadata: {
+      ...metadata,
+      id: id.trim(),
+      name: name.trim(),
+      description: typeof metadata.description === 'string' ? metadata.description : '',
+      version: typeof metadata.version === 'string' && metadata.version.trim().length > 0 ? metadata.version : '1.0.0',
+      variant,
+      tags,
+    },
+  };
+};
+
+const readCustomThemesFromDisk = async () => {
+  try {
+    const entries = await fsPromises.readdir(OPENCHAMBER_USER_THEMES_DIR, { withFileTypes: true });
+    const themes = [];
+    const seen = new Set();
+
+    for (const entry of entries) {
+      if (!entry.isFile()) continue;
+      if (!entry.name.toLowerCase().endsWith('.json')) continue;
+
+      const filePath = path.join(OPENCHAMBER_USER_THEMES_DIR, entry.name);
+      try {
+        const stat = await fsPromises.stat(filePath);
+        if (!stat.isFile()) continue;
+        if (stat.size > MAX_THEME_JSON_BYTES) {
+          console.warn(`[themes] Skip ${entry.name}: too large (${stat.size} bytes)`);
+          continue;
+        }
+
+        const rawText = await fsPromises.readFile(filePath, 'utf8');
+        const parsed = JSON.parse(rawText);
+        const normalized = normalizeThemeJson(parsed);
+        if (!normalized) {
+          console.warn(`[themes] Skip ${entry.name}: invalid theme JSON`);
+          continue;
+        }
+
+        const id = normalized.metadata.id;
+        if (seen.has(id)) {
+          console.warn(`[themes] Skip ${entry.name}: duplicate theme id "${id}"`);
+          continue;
+        }
+
+        seen.add(id);
+        themes.push(normalized);
+      } catch (error) {
+        console.warn(`[themes] Failed to read ${entry.name}:`, error);
+      }
+    }
+
+    return themes;
+  } catch (error) {
+    // Missing dir is fine.
+    if (error && typeof error === 'object' && error.code === 'ENOENT') {
+      return [];
+    }
+    console.warn('[themes] Failed to list custom themes dir:', error);
+    return [];
+  }
+};
 
 const isPathWithinRoot = (resolvedPath, rootPath) => {
   const resolvedRoot = path.resolve(rootPath || os.homedir());
@@ -821,6 +978,15 @@ const sanitizeSettingsUpdate = (payload) => {
   if (typeof candidate.notifyOnSubtasks === 'boolean') {
     result.notifyOnSubtasks = candidate.notifyOnSubtasks;
   }
+  if (typeof candidate.usageAutoRefresh === 'boolean') {
+    result.usageAutoRefresh = candidate.usageAutoRefresh;
+  }
+  if (typeof candidate.usageRefreshIntervalMs === 'number' && Number.isFinite(candidate.usageRefreshIntervalMs)) {
+    result.usageRefreshIntervalMs = Math.max(30000, Math.min(300000, Math.round(candidate.usageRefreshIntervalMs)));
+  }
+  if (Array.isArray(candidate.usageDropdownProviders)) {
+    result.usageDropdownProviders = normalizeStringArray(candidate.usageDropdownProviders);
+  }
   if (typeof candidate.autoDeleteEnabled === 'boolean') {
     result.autoDeleteEnabled = candidate.autoDeleteEnabled;
   }
@@ -1092,13 +1258,58 @@ const migrateSettingsFromLegacyLastDirectory = async (current) => {
   return { settings: merged, changed: true };
 };
 
+const migrateSettingsFromLegacyThemePreferences = async (current) => {
+  const settings = current && typeof current === 'object' ? current : {};
+
+  const themeId = typeof settings.themeId === 'string' ? settings.themeId.trim() : '';
+  const themeVariant = typeof settings.themeVariant === 'string' ? settings.themeVariant.trim() : '';
+
+  const hasLight = typeof settings.lightThemeId === 'string' && settings.lightThemeId.trim().length > 0;
+  const hasDark = typeof settings.darkThemeId === 'string' && settings.darkThemeId.trim().length > 0;
+
+  if (hasLight && hasDark) {
+    return { settings, changed: false };
+  }
+
+  const defaultLight = 'flexoki-light';
+  const defaultDark = 'flexoki-dark';
+
+  let nextLightThemeId = hasLight ? settings.lightThemeId : undefined;
+  let nextDarkThemeId = hasDark ? settings.darkThemeId : undefined;
+
+  if (!hasLight) {
+    if (themeId && themeVariant === 'light') {
+      nextLightThemeId = themeId;
+    } else {
+      nextLightThemeId = defaultLight;
+    }
+  }
+
+  if (!hasDark) {
+    if (themeId && themeVariant === 'dark') {
+      nextDarkThemeId = themeId;
+    } else {
+      nextDarkThemeId = defaultDark;
+    }
+  }
+
+  const merged = mergePersistedSettings(settings, {
+    ...settings,
+    ...(nextLightThemeId ? { lightThemeId: nextLightThemeId } : {}),
+    ...(nextDarkThemeId ? { darkThemeId: nextDarkThemeId } : {}),
+  });
+
+  return { settings: merged, changed: true };
+};
+
 const readSettingsFromDiskMigrated = async () => {
   const current = await readSettingsFromDisk();
-  const { settings, changed } = await migrateSettingsFromLegacyLastDirectory(current);
-  if (changed) {
-    await writeSettingsToDisk(settings);
+  const migration1 = await migrateSettingsFromLegacyLastDirectory(current);
+  const migration2 = await migrateSettingsFromLegacyThemePreferences(migration1.settings);
+  if (migration1.changed || migration2.changed) {
+    await writeSettingsToDisk(migration2.settings);
   }
-  return settings;
+  return migration2.settings;
 };
 
 const getOrCreateVapidKeys = async () => {
@@ -1751,13 +1962,19 @@ async function waitForReady(url, timeoutMs = 10000) {
     try {
       const controller = new AbortController();
       const timeout = setTimeout(() => controller.abort(), 3000);
-      const res = await fetch(`${url.replace(/\/+$/, '')}/config`, {
+      const res = await fetch(`${url.replace(/\/+$/, '')}/global/health`, {
         method: 'GET',
         headers: { Accept: 'application/json' },
         signal: controller.signal
       });
       clearTimeout(timeout);
-      if (res.ok) return true;
+
+      if (res.ok) {
+        const body = await res.json().catch(() => null);
+        if (body?.healthy === true) {
+          return true;
+        }
+      }
     } catch {
       // ignore
     }
@@ -3338,6 +3555,16 @@ async function main(options = {}) {
     }
   });
 
+  app.get('/api/config/themes', async (_req, res) => {
+    try {
+      const customThemes = await readCustomThemesFromDisk();
+      res.json({ themes: customThemes });
+    } catch (error) {
+      console.error('Failed to load custom themes:', error);
+      res.status(500).json({ error: error instanceof Error ? error.message : 'Failed to load custom themes' });
+    }
+  });
+
   app.put('/api/config/settings', async (req, res) => {
     console.log(`[API:PUT /api/config/settings] Received request`);
     console.log(`[API:PUT /api/config/settings] Request body:`, JSON.stringify(req.body, null, 2));
@@ -4144,6 +4371,14 @@ async function main(options = {}) {
       authLibrary = await import('./lib/opencode-auth.js');
     }
     return authLibrary;
+  };
+
+  let quotaProviders = null;
+  const getQuotaProviders = async () => {
+    if (!quotaProviders) {
+      quotaProviders = await import('./lib/quota-providers.js');
+    }
+    return quotaProviders;
   };
 
   // ================= GitHub OAuth (Device Flow) =================
@@ -5277,6 +5512,32 @@ async function main(options = {}) {
     }
   });
 
+  app.get('/api/quota/providers', async (_req, res) => {
+    try {
+      const { listConfiguredQuotaProviders } = await getQuotaProviders();
+      const providers = listConfiguredQuotaProviders();
+      res.json({ providers });
+    } catch (error) {
+      console.error('Failed to list quota providers:', error);
+      res.status(500).json({ error: error.message || 'Failed to list quota providers' });
+    }
+  });
+
+  app.get('/api/quota/:providerId', async (req, res) => {
+    try {
+      const { providerId } = req.params;
+      if (!providerId) {
+        return res.status(400).json({ error: 'Provider ID is required' });
+      }
+      const { fetchQuotaForProvider } = await getQuotaProviders();
+      const result = await fetchQuotaForProvider(providerId);
+      res.json(result);
+    } catch (error) {
+      console.error('Failed to fetch quota:', error);
+      res.status(500).json({ error: error.message || 'Failed to fetch quota' });
+    }
+  });
+
   app.delete('/api/provider/:providerId/auth', async (req, res) => {
     try {
       const { providerId } = req.params;
@@ -5725,6 +5986,7 @@ async function main(options = {}) {
 
       const base = typeof req.body?.base === 'string' ? req.body.base.trim() : '';
       const head = typeof req.body?.head === 'string' ? req.body.head.trim() : '';
+      const context = typeof req.body?.context === 'string' ? req.body.context.trim() : '';
       if (!base || !head) {
         return res.status(400).json({ error: 'base and head are required' });
       }
@@ -5744,7 +6006,22 @@ async function main(options = {}) {
 
       const diffSummaries = diffs.map(({ path, diff }) => `FILE: ${path}\n${diff}`).join('\n\n');
 
-      const prompt = `You are drafting a GitHub Pull Request title + description. Respond in JSON of the shape {"title": string, "body": string} (ONLY JSON in response, no markdown fences) with these rules:\n- title: concise, sentence case, <= 80 chars, no trailing punctuation, no commit-style prefixes (no "feat:", "fix:")\n- body: GitHub-flavored markdown with these sections in this order: Summary, Testing, Notes\n- Summary: 3-6 bullet points describing user-visible changes; avoid internal helper function names\n- Testing: bullet list ("- Not tested" allowed)\n- Notes: bullet list; include breaking/rollout notes only when relevant\n\nContext:\n- base branch: ${base}\n- head branch: ${head}\n\nDiff summary:\n${diffSummaries}`;
+      let prompt = `You are drafting a GitHub Pull Request title + description. Respond in JSON of the shape {"title": string, "body": string} (ONLY JSON in response, no markdown fences) with these rules:
+- title: concise, sentence case, <= 80 chars, no trailing punctuation, no commit-style prefixes (no "feat:", "fix:")
+- body: GitHub-flavored markdown with these sections in this order: Summary, Testing, Notes
+- Summary: 3-6 bullet points describing user-visible changes; avoid internal helper function names
+- Testing: bullet list ("- Not tested" allowed)
+- Notes: bullet list; include breaking/rollout notes only when relevant
+
+Context:
+- base branch: ${base}
+- head branch: ${head}`;
+
+      if (context) {
+        prompt += `\n\nAdditional context provided by user:\n${context}`;
+      }
+
+      prompt += `\n\nDiff summary:\n${diffSummaries}`;
 
       const model = 'gpt-5-nano';
 

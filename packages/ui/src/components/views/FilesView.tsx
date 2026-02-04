@@ -66,6 +66,9 @@ import { useSessionStore } from '@/stores/useSessionStore';
 import { useConfigStore } from '@/stores/useConfigStore';
 import { useContextStore } from '@/stores/contextStore';
 import { useUIStore } from '@/stores/useUIStore';
+import { useMessageQueueStore } from '@/stores/messageQueueStore';
+import { useCurrentSessionActivity } from '@/hooks/useSessionActivity';
+import { useFilesViewTabsStore } from '@/stores/useFilesViewTabsStore';
 import { opencodeClient } from '@/lib/opencode/client';
 import { useDirectoryShowHidden } from '@/lib/directoryShowHidden';
 import { useFilesViewShowGitignored } from '@/lib/filesViewShowGitignored';
@@ -226,13 +229,13 @@ const getFileIcon = (extension?: string): React.ReactNode => {
   const ext = extension?.toLowerCase();
 
   if (ext && CODE_EXTENSIONS.has(ext)) {
-    return <RiCodeLine className="h-4 w-4 flex-shrink-0 text-blue-500" />;
+    return <RiCodeLine className="h-4 w-4 flex-shrink-0 text-[var(--status-info)]" />;
   }
   if (ext && DATA_EXTENSIONS.has(ext)) {
-    return <RiCodeLine className="h-4 w-4 flex-shrink-0 text-yellow-500" />;
+    return <RiCodeLine className="h-4 w-4 flex-shrink-0 text-[var(--status-warning)]" />;
   }
   if (ext && IMAGE_EXTENSIONS.has(ext)) {
-    return <RiFileImageLine className="h-4 w-4 flex-shrink-0 text-green-500" />;
+    return <RiFileImageLine className="h-4 w-4 flex-shrink-0 text-[var(--status-success)]" />;
   }
   if (ext && DOCUMENT_EXTENSIONS.has(ext)) {
     return <RiFileTextLine className="h-4 w-4 flex-shrink-0 text-muted-foreground" />;
@@ -255,7 +258,7 @@ export const FilesView: React.FC = () => {
   const showGitignored = useFilesViewShowGitignored();
 
   const currentDirectory = useEffectiveDirectory() ?? '';
-  const root = normalizePath(currentDirectory);
+  const root = normalizePath(currentDirectory.trim());
   const searchFiles = useFileSearchStore((state) => state.searchFiles);
 
   const [searchQuery, setSearchQuery] = React.useState('');
@@ -274,12 +277,37 @@ export const FilesView: React.FC = () => {
   const [searchResults, setSearchResults] = React.useState<FileNode[]>([]);
   const [searching, setSearching] = React.useState(false);
 
-  const [selectedFile, setSelectedFile] = React.useState<FileNode | null>(null);
-  const [openFiles, setOpenFiles] = React.useState<FileNode[]>([]);
+  const EMPTY_PATHS: string[] = React.useMemo(() => [], []);
+  const openPaths = useFilesViewTabsStore((state) => (root ? (state.byRoot[root]?.openPaths ?? EMPTY_PATHS) : EMPTY_PATHS));
+  const selectedPath = useFilesViewTabsStore((state) => (root ? (state.byRoot[root]?.selectedPath ?? null) : null));
+  const addOpenPath = useFilesViewTabsStore((state) => state.addOpenPath);
+  const removeOpenPath = useFilesViewTabsStore((state) => state.removeOpenPath);
+  const removeOpenPathsByPrefix = useFilesViewTabsStore((state) => state.removeOpenPathsByPrefix);
+  const setSelectedPath = useFilesViewTabsStore((state) => state.setSelectedPath);
+
+  const toFileNode = React.useCallback((path: string): FileNode => {
+    const normalized = normalizePath(path);
+    const parts = normalized.split('/');
+    const name = parts[parts.length - 1] || normalized;
+    const extension = name.includes('.') ? name.split('.').pop()?.toLowerCase() : undefined;
+    return {
+      name,
+      path: normalized,
+      type: 'file',
+      extension,
+    };
+  }, []);
+
+  const openFiles = React.useMemo(() => openPaths.map(toFileNode), [openPaths, toFileNode]);
+  const effectiveSelectedPath = React.useMemo(() => selectedPath ?? openPaths[0] ?? null, [openPaths, selectedPath]);
+  const selectedFile = React.useMemo(() => (effectiveSelectedPath ? toFileNode(effectiveSelectedPath) : null), [effectiveSelectedPath, toFileNode]);
+
   const [fileContent, setFileContent] = React.useState<string>('');
   const [fileLoading, setFileLoading] = React.useState(false);
   const [fileError, setFileError] = React.useState<string | null>(null);
   const [desktopImageSrc, setDesktopImageSrc] = React.useState<string>('');
+
+  const [loadedFilePath, setLoadedFilePath] = React.useState<string | null>(null);
 
   const [draftContent, setDraftContent] = React.useState('');
   const [isSaving, setIsSaving] = React.useState(false);
@@ -330,7 +358,11 @@ export const FilesView: React.FC = () => {
   const getAgentModelVariantForSession = useContextStore((state) => state.getAgentModelVariantForSession);
   const setActiveMainTab = useUIStore((state) => state.setActiveMainTab);
   const setMainTabGuard = useUIStore((state) => state.setMainTabGuard);
-  const { inputBarOffset, isKeyboardOpen } = useUIStore();
+  const inputBarOffset = useUIStore((state) => state.inputBarOffset);
+  const isKeyboardOpen = useUIStore((state) => state.isKeyboardOpen);
+  const queueModeEnabled = useMessageQueueStore((state) => state.queueModeEnabled);
+  const addToQueue = useMessageQueueStore((state) => state.addToQueue);
+  const { phase: sessionPhase } = useCurrentSessionActivity();
 
 
   // Global mouseup to end drag selection
@@ -440,19 +472,25 @@ export const FilesView: React.FC = () => {
     setLineSelection(null);
     setActiveMainTab('chat');
 
-    void sendMessage(
-      message,
-      effectiveProviderId,
-      effectiveModelId,
-      sessionAgent,
-      undefined,
-      undefined,
-      undefined,
-      effectiveVariant
-    ).catch((e) => {
-      console.error('Failed to send comment', e);
-    });
-  }, [lineSelection, commentText, selectedFile, fileContent, currentSessionId, currentProviderId, currentModelId, currentAgentName, currentVariant, extractSelectedCode, sendMessage, setActiveMainTab, getSessionAgentSelection, getAgentModelForSession, getAgentModelVariantForSession]);
+    // Check if should queue instead of send
+    const canQueue = sessionPhase !== 'idle';
+    if (queueModeEnabled && canQueue) {
+      addToQueue(currentSessionId, { content: message });
+    } else {
+      void sendMessage(
+        message,
+        effectiveProviderId,
+        effectiveModelId,
+        sessionAgent,
+        undefined,
+        undefined,
+        undefined,
+        effectiveVariant
+      ).catch((e) => {
+        console.error('Failed to send comment', e);
+      });
+    }
+  }, [lineSelection, commentText, selectedFile, fileContent, currentSessionId, currentProviderId, currentModelId, currentAgentName, currentVariant, extractSelectedCode, sendMessage, setActiveMainTab, getSessionAgentSelection, getAgentModelForSession, getAgentModelVariantForSession, queueModeEnabled, sessionPhase, addToQueue]);
 
   const mapDirectoryEntries = React.useCallback((dirPath: string, entries: Array<{ name: string; path: string; isDirectory: boolean }>): FileNode[] => {
     const nodes = entries
@@ -524,42 +562,52 @@ export const FilesView: React.FC = () => {
   }, [files, mapDirectoryEntries, runtime.isDesktop, showGitignored]);
 
   const refreshRoot = React.useCallback(async () => {
-    const normalizedRoot = normalizePath(currentDirectory.trim());
-    if (!normalizedRoot) {
+    if (!root) {
       return;
     }
 
     loadedDirsRef.current = new Set();
     inFlightDirsRef.current = new Set();
-    setExpandedDirs(new Set());
-    setChildrenByDir({});
+    setExpandedDirs((prev) => (prev.size === 0 ? prev : new Set()));
+    setChildrenByDir((prev) => (Object.keys(prev).length === 0 ? prev : {}));
 
-    await loadDirectory(normalizedRoot);
-  }, [currentDirectory, loadDirectory]);
+    await loadDirectory(root);
+  }, [loadDirectory, root]);
 
-
+  const lastFilesViewDirRef = React.useRef<string>('');
+  const lastFilesViewTreeKeyRef = React.useRef<string>('');
 
   React.useEffect(() => {
-    if (!currentDirectory) {
+    if (!root) {
       return;
     }
 
-    void refreshRoot();
-    setSelectedFile(null);
-    setOpenFiles([]);
-    setFileContent('');
-    setFileError(null);
-    setDesktopImageSrc('');
-    setShowMobilePageContent(false);
-  }, [currentDirectory, refreshRoot]);
+    const treeKey = `${root}|h${showHidden ? '1' : '0'}|g${showGitignored ? '1' : '0'}`;
+    const dirChanged = lastFilesViewDirRef.current !== root;
+    const treeKeyChanged = lastFilesViewTreeKeyRef.current !== treeKey;
 
-  React.useEffect(() => {
-    if (!currentDirectory) {
+    if (!dirChanged && !treeKeyChanged) {
       return;
     }
 
-    void refreshRoot();
-  }, [currentDirectory, refreshRoot, showGitignored]);
+    if (dirChanged) {
+      lastFilesViewDirRef.current = root;
+      setFileContent('');
+      setFileError(null);
+      setDesktopImageSrc('');
+      setLoadedFilePath(null);
+      setShowMobilePageContent(false);
+    }
+
+    if (treeKeyChanged) {
+      lastFilesViewTreeKeyRef.current = treeKey;
+      loadedDirsRef.current = new Set();
+      inFlightDirsRef.current = new Set();
+      setExpandedDirs((prev) => (prev.size === 0 ? prev : new Set()));
+      setChildrenByDir((prev) => (Object.keys(prev).length === 0 ? prev : {}));
+      void loadDirectory(root);
+    }
+  }, [loadDirectory, root, showGitignored, showHidden]);
 
   const MD_VIEWER_MODE_KEY = 'openchamber:files:md-viewer-mode';
 
@@ -631,41 +679,51 @@ export const FilesView: React.FC = () => {
         const newPath = normalizePath(`${prefix}${dialogInputValue.trim()}`);
 
         if (files.rename) {
-            const result = await files.rename(oldPath, newPath);
-            if (result.success) {
-                toast.success('Renamed successfully');
-                await refreshRoot();
-                setOpenFiles((prev) => prev.filter((file) => file.path !== oldPath && !file.path.startsWith(`${oldPath}/`)));
-                if (selectedFile?.path === oldPath || selectedFile?.path.startsWith(`${oldPath}/`)) {
-                    setSelectedFile(null);
-                    setFileContent('');
-                    setFileError(null);
-                    setDesktopImageSrc('');
-                    if (isMobile) {
-                      setShowMobilePageContent(false);
-                    }
-                }
-            }
+             const result = await files.rename(oldPath, newPath);
+             if (result.success) {
+                 toast.success('Renamed successfully');
+                 await refreshRoot();
+                 if (root) {
+                   removeOpenPathsByPrefix(root, oldPath);
+                 }
+                 if (selectedFile?.path === oldPath || selectedFile?.path.startsWith(`${oldPath}/`)) {
+                     if (root) {
+                       setSelectedPath(root, null);
+                     }
+                     setFileContent('');
+                     setFileError(null);
+                     setDesktopImageSrc('');
+                     setLoadedFilePath(null);
+                     if (isMobile) {
+                       setShowMobilePageContent(false);
+                     }
+                 }
+             }
         } else {
             toast.error("Rename not supported");
         }
       } else if (activeDialog === 'delete') {
         if (files.delete) {
-            const result = await files.delete(dialogData.path);
-            if (result.success) {
-                toast.success('Deleted successfully');
-                await refreshRoot();
-                setOpenFiles((prev) => prev.filter((file) => file.path !== dialogData.path && !file.path.startsWith(`${dialogData.path}/`)));
-                if (selectedFile?.path === dialogData.path || selectedFile?.path.startsWith(dialogData.path + '/')) {
-                    setSelectedFile(null);
-                    setFileContent('');
-                    setFileError(null);
-                    setDesktopImageSrc('');
-                    if (isMobile) {
-                      setShowMobilePageContent(false);
-                    }
-                }
-            }
+             const result = await files.delete(dialogData.path);
+             if (result.success) {
+                 toast.success('Deleted successfully');
+                 await refreshRoot();
+                 if (root) {
+                   removeOpenPathsByPrefix(root, dialogData.path);
+                 }
+                 if (selectedFile?.path === dialogData.path || selectedFile?.path.startsWith(dialogData.path + '/')) {
+                     if (root) {
+                       setSelectedPath(root, null);
+                     }
+                     setFileContent('');
+                     setFileError(null);
+                     setDesktopImageSrc('');
+                     setLoadedFilePath(null);
+                     if (isMobile) {
+                       setShowMobilePageContent(false);
+                     }
+                 }
+             }
         } else {
              toast.error("Delete not supported");
         }
@@ -676,7 +734,7 @@ export const FilesView: React.FC = () => {
     } finally {
       setIsDialogSubmitting(false);
     }
-  }, [activeDialog, dialogData, dialogInputValue, files, refreshRoot, selectedFile, isMobile]);
+  }, [activeDialog, dialogData, dialogInputValue, files, refreshRoot, isMobile, removeOpenPathsByPrefix, root, selectedFile?.path, setSelectedPath]);
 
   const fuzzyScore = React.useCallback((query: string, candidate: string): number | null => {
     const q = query.trim().toLowerCase();
@@ -727,14 +785,6 @@ export const FilesView: React.FC = () => {
     score += Math.max(0, 24 - Math.round(c.length / 3));
     return score;
   }, []);
-
-  React.useEffect(() => {
-    if (!currentDirectory) {
-      return;
-    }
-
-    void refreshRoot();
-  }, [currentDirectory, refreshRoot, showGitignored]);
 
   React.useEffect(() => {
     if (!currentDirectory) {
@@ -899,51 +949,22 @@ export const FilesView: React.FC = () => {
     return () => window.removeEventListener('keydown', handleKeyDown);
   }, [isSaving, saveDraft]);
 
-  const upsertOpenFile = React.useCallback((node: FileNode) => {
-    setOpenFiles((prev) => {
-      const index = prev.findIndex((file) => file.path === node.path);
-      if (index === -1) {
-        return [...prev, node];
-      }
-      const next = prev.slice();
-      next[index] = node;
-      return next;
-    });
-  }, []);
-
-  const getNextOpenFile = React.useCallback((path: string, filesList: FileNode[]) => {
-    const index = filesList.findIndex((file) => file.path === path);
-    if (index === -1 || filesList.length <= 1) {
-      return null;
-    }
-    return filesList[index + 1] ?? filesList[index - 1] ?? null;
-  }, []);
-
-  const handleSelectFile = React.useCallback(async (node: FileNode) => {
-    if (skipDirtyOnceRef.current) {
-      skipDirtyOnceRef.current = false;
-    } else if (isDirty) {
-      setConfirmDiscardOpen(true);
-      pendingSelectFileRef.current = node;
-      return;
-    }
-
-    setSelectedFile(node);
-    upsertOpenFile(node);
+  const loadSelectedFile = React.useCallback(async (node: FileNode) => {
     setFileError(null);
     setDesktopImageSrc('');
+    setLoadedFilePath(node.path);
 
     const selectedIsImage = isImageFile(node.path);
+    const isSvg = node.path.toLowerCase().endsWith('.svg');
 
     if (isMobile) {
       setShowMobilePageContent(true);
     }
 
-    const isSvg = node.path.toLowerCase().endsWith('.svg');
-
     // Desktop: binary images are loaded via readFileBinary (data URL).
     if (runtime.isDesktop && selectedIsImage && !isSvg) {
       setFileContent('');
+      setDraftContent('');
       setFileLoading(true);
       return;
     }
@@ -951,6 +972,7 @@ export const FilesView: React.FC = () => {
     // Web: binary images should not be read as utf8.
     if (!runtime.isDesktop && selectedIsImage && !isSvg) {
       setFileContent('');
+      setDraftContent('');
       setFileLoading(false);
       return;
     }
@@ -970,7 +992,52 @@ export const FilesView: React.FC = () => {
     } finally {
       setFileLoading(false);
     }
-  }, [isDirty, isMobile, readFile, runtime.isDesktop, upsertOpenFile]);
+  }, [isMobile, readFile, runtime.isDesktop]);
+
+  const getNextOpenFile = React.useCallback((path: string, filesList: FileNode[]) => {
+    const index = filesList.findIndex((file) => file.path === path);
+    if (index === -1 || filesList.length <= 1) {
+      return null;
+    }
+    return filesList[index + 1] ?? filesList[index - 1] ?? null;
+  }, []);
+
+  const handleSelectFile = React.useCallback(async (node: FileNode) => {
+    if (skipDirtyOnceRef.current) {
+      skipDirtyOnceRef.current = false;
+    } else if (isDirty) {
+      setConfirmDiscardOpen(true);
+      pendingSelectFileRef.current = node;
+      return;
+    }
+
+    if (root) {
+      setSelectedPath(root, node.path);
+      addOpenPath(root, node.path);
+    }
+
+    setFileError(null);
+    setDesktopImageSrc('');
+    setFileContent('');
+    setDraftContent('');
+    setLoadedFilePath(null);
+    if (isMobile) {
+      setShowMobilePageContent(true);
+    }
+  }, [addOpenPath, isDirty, isMobile, root, setSelectedPath]);
+
+  React.useEffect(() => {
+    if (!selectedFile) {
+      return;
+    }
+
+    if (loadedFilePath === selectedFile.path) {
+      return;
+    }
+
+    // Selection changes are guarded; this effect is also what restores persisted tabs on mount.
+    void loadSelectedFile(selectedFile);
+  }, [loadSelectedFile, loadedFilePath, selectedFile]);
 
   const discardAndContinue = React.useCallback(() => {
     const nextFile = pendingSelectFileRef.current;
@@ -990,15 +1057,20 @@ export const FilesView: React.FC = () => {
     setDraftContent(displayedContent);
 
     if (closePath) {
-      setOpenFiles((prev) => prev.filter((file) => file.path !== closePath));
+      if (root) {
+        removeOpenPath(root, closePath);
+      }
       if (selectedFile?.path === closePath) {
         if (nextFile) {
           void handleSelectFile(nextFile);
         } else {
-          setSelectedFile(null);
+          if (root) {
+            setSelectedPath(root, null);
+          }
           setFileContent('');
           setFileError(null);
           setDesktopImageSrc('');
+          setLoadedFilePath(null);
           if (isMobile) {
             setShowMobilePageContent(false);
           }
@@ -1016,7 +1088,7 @@ export const FilesView: React.FC = () => {
       setMainTabGuard(null);
       useUIStore.getState().setActiveMainTab(nextTab);
     }
-  }, [displayedContent, handleSelectFile, isMobile, selectedFile?.path, setMainTabGuard]);
+  }, [displayedContent, handleSelectFile, isMobile, removeOpenPath, root, selectedFile?.path, setMainTabGuard, setSelectedPath]);
 
   const saveAndContinue = React.useCallback(async () => {
     const nextFile = pendingSelectFileRef.current;
@@ -1035,15 +1107,20 @@ export const FilesView: React.FC = () => {
     await saveDraft();
 
     if (closePath) {
-      setOpenFiles((prev) => prev.filter((file) => file.path !== closePath));
+      if (root) {
+        removeOpenPath(root, closePath);
+      }
       if (selectedFile?.path === closePath) {
         if (nextFile) {
           await handleSelectFile(nextFile);
         } else {
-          setSelectedFile(null);
+          if (root) {
+            setSelectedPath(root, null);
+          }
           setFileContent('');
           setFileError(null);
           setDesktopImageSrc('');
+          setLoadedFilePath(null);
           if (isMobile) {
             setShowMobilePageContent(false);
           }
@@ -1061,7 +1138,7 @@ export const FilesView: React.FC = () => {
       setMainTabGuard(null);
       useUIStore.getState().setActiveMainTab(nextTab);
     }
-  }, [handleSelectFile, isMobile, saveDraft, selectedFile?.path, setMainTabGuard]);
+  }, [handleSelectFile, isMobile, removeOpenPath, root, saveDraft, selectedFile?.path, setMainTabGuard, setSelectedPath]);
 
   const handleCloseFile = React.useCallback((path: string) => {
     const isActive = selectedFile?.path === path;
@@ -1074,7 +1151,9 @@ export const FilesView: React.FC = () => {
       return;
     }
 
-    setOpenFiles((prev) => prev.filter((file) => file.path !== path));
+    if (root) {
+      removeOpenPath(root, path);
+    }
 
     if (!isActive) {
       return;
@@ -1085,14 +1164,17 @@ export const FilesView: React.FC = () => {
       return;
     }
 
-    setSelectedFile(null);
+    if (root) {
+      setSelectedPath(root, null);
+    }
     setFileContent('');
     setFileError(null);
     setDesktopImageSrc('');
+    setLoadedFilePath(null);
     if (isMobile) {
       setShowMobilePageContent(false);
     }
-  }, [getNextOpenFile, handleSelectFile, isDirty, isMobile, openFiles, selectedFile?.path]);
+  }, [getNextOpenFile, handleSelectFile, isDirty, isMobile, openFiles, removeOpenPath, root, selectedFile?.path, setSelectedPath]);
 
   const toggleDirectory = React.useCallback(async (dirPath: string) => {
     const normalized = normalizePath(dirPath);
@@ -1152,7 +1234,7 @@ export const FilesView: React.FC = () => {
               }}
               className={cn(
                 'flex w-full items-center gap-1.5 rounded-md px-2 py-1 text-left text-foreground transition-colors pr-8 select-none',
-                isActive ? 'bg-accent/70' : 'hover:bg-accent/40'
+                isActive ? 'bg-interactive-selection/70' : 'hover:bg-interactive-hover/40'
               )}
             >
               {isDir ? (
@@ -1398,7 +1480,12 @@ export const FilesView: React.FC = () => {
         className="flex flex-col items-center gap-2 px-4"
         style={{ width: 'min(100vw - 1rem, 42rem)' }}
       >
-        <div className="w-full rounded-xl border bg-background flex flex-col relative shadow-lg" style={{ borderColor: 'var(--primary)' }}>
+        <div 
+          className="w-full rounded-xl flex flex-col relative shadow-lg border border-border/80 focus-within:border-primary/70 focus-within:ring-1 focus-within:ring-primary/50"
+          style={{ 
+            backgroundColor: currentTheme?.colors?.surface?.subtle,
+          }}
+        >
           <Textarea
             value={commentText}
             onChange={(e) => {
@@ -1410,7 +1497,8 @@ export const FilesView: React.FC = () => {
               textarea.style.height = `${Math.min(textarea.scrollHeight, maxHeight)}px`;
             }}
             placeholder="Type your comment..."
-            className="min-h-[28px] max-h-[108px] resize-none border-0 px-3 pt-2 pb-1 shadow-none rounded-none appearance-none focus:shadow-none focus-visible:shadow-none focus-visible:border-transparent focus-visible:ring-0 focus-visible:ring-transparent hover:border-transparent bg-transparent dark:bg-transparent focus-visible:outline-none overflow-y-auto"
+            outerClassName="focus-within:ring-0"
+            className="min-h-[28px] max-h-[108px] resize-none border-0 px-3 pt-2 pb-1 rounded-none appearance-none hover:border-transparent bg-transparent dark:bg-transparent overflow-y-auto focus:ring-0 focus:shadow-none"
             autoFocus={!isMobile}
             rows={1}
             onKeyDown={(e) => {
@@ -1538,7 +1626,7 @@ export const FilesView: React.FC = () => {
                         }}
                         className={cn(
                           'flex items-center justify-between gap-2',
-                          isActive && 'bg-accent/70'
+                          isActive && 'bg-[var(--interactive-selection)] text-[var(--interactive-selection-foreground)]'
                         )}
                       >
                         <span className="min-w-0 flex-1 truncate">
@@ -1556,7 +1644,7 @@ export const FilesView: React.FC = () => {
                             event.stopPropagation();
                             handleCloseFile(file.path);
                           }}
-                          className="inline-flex h-6 w-6 items-center justify-center rounded-md text-muted-foreground hover:text-foreground"
+                          className="inline-flex h-6 w-6 items-center justify-center rounded-md text-[var(--surface-muted-foreground)] hover:text-[var(--surface-foreground)]"
                           aria-label={`Close ${file.name}`}
                         >
                           <RiCloseLine className="h-3.5 w-3.5" />
@@ -1580,10 +1668,10 @@ export const FilesView: React.FC = () => {
                         key={file.path}
                         title={getDisplayPath(file.path)}
                         className={cn(
-                          'group inline-flex items-center gap-1 rounded-md border px-2 py-1 typography-ui-label transition-colors',
+                          'group inline-flex items-center gap-1 rounded-md border px-2 py-1 typography-ui-label transition-colors whitespace-nowrap',
                           isActive
-                            ? 'border-border/60 bg-accent/70 text-foreground'
-                            : 'border-transparent text-muted-foreground hover:bg-accent/40 hover:text-foreground'
+                            ? 'bg-[var(--interactive-selection)] border-[var(--primary-muted)] text-[var(--interactive-selection-foreground)]'
+                            : 'bg-transparent border-[var(--interactive-border)] text-[var(--surface-muted-foreground)] hover:bg-[var(--interactive-hover)] hover:text-[var(--surface-foreground)]'
                         )}
                       >
                         <button
@@ -1603,10 +1691,13 @@ export const FilesView: React.FC = () => {
                             event.stopPropagation();
                             handleCloseFile(file.path);
                           }}
-                          className="inline-flex h-4 w-4 items-center justify-center rounded-sm text-muted-foreground hover:text-foreground"
+                          className={cn(
+                            'rounded-sm p-0.5 text-[var(--surface-muted-foreground)] hover:text-[var(--surface-foreground)]',
+                            !isActive && 'opacity-0 group-hover:opacity-100'
+                          )}
                           aria-label={`Close ${file.name}`}
                         >
-                          <RiCloseLine className="h-3.5 w-3.5" />
+                          <RiCloseLine size={14} />
                         </button>
                       </div>
                     );
@@ -1777,7 +1868,7 @@ export const FilesView: React.FC = () => {
           ) : selectedFile && isMarkdownFile(selectedFile.path) && getMdViewMode() === 'preview' ? (
             <div className="h-full overflow-auto p-3">
               {fileContent.length > 500 * 1024 && (
-                <div className="mb-3 rounded-md border border-warning/20 bg-warning/10 px-3 py-2 text-sm text-warning">
+                <div className="mb-3 rounded-md border border-status-warning/20 bg-status-warning/10 px-3 py-2 text-sm text-status-warning">
                   ⚠️ This file is large ({Math.round(fileContent.length / 1024)}KB). Preview may be limited.
                 </div>
               )}
@@ -1973,7 +2064,7 @@ export const FilesView: React.FC = () => {
                     onClick={() => void handleSelectFile(node)}
                     className={cn(
                       'flex w-full items-center gap-1.5 rounded-md px-2 py-1 text-left text-foreground transition-colors',
-                      isActive ? 'bg-accent/70' : 'hover:bg-accent/40'
+                      isActive ? 'bg-interactive-selection/70' : 'hover:bg-interactive-hover/40'
                     )}
                   >
                     {getFileIcon(node.extension)}
@@ -2156,7 +2247,7 @@ export const FilesView: React.FC = () => {
           ) : isMarkdownFile(selectedFile.path) && getMdViewMode() === 'preview' ? (
             <div className="h-full overflow-auto p-4">
               {fileContent.length > 500 * 1024 && (
-                <div className="mb-3 rounded-md border border-warning/20 bg-warning/10 px-3 py-2 text-sm text-warning">
+                <div className="mb-3 rounded-md border border-status-warning/20 bg-status-warning/10 px-3 py-2 text-sm text-status-warning">
                   This file is large ({Math.round(fileContent.length / 1024)}KB). Preview may be limited.
                 </div>
               )}
@@ -2200,7 +2291,7 @@ export const FilesView: React.FC = () => {
         )
        ) : (
          <div className="flex flex-1 min-h-0 min-w-0 gap-3 px-3 pb-3 pt-2">
-           {screenWidth >= 1024 && (
+           {screenWidth >= 700 && (
              <div className="w-72 flex-shrink-0 min-h-0 overflow-hidden">
                {treePanel}
              </div>

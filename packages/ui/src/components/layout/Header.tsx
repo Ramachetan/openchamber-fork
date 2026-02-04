@@ -13,11 +13,13 @@ import {
   DropdownMenuTrigger,
 } from '@/components/ui/dropdown-menu';
 
-import { RiArrowLeftSLine, RiChat4Line, RiCheckLine, RiCodeLine, RiCommandLine, RiFileTextLine, RiFolder6Line, RiGitBranchLine, RiGithubFill, RiLayoutLeftLine, RiPlayListAddLine, RiQuestionLine, RiSettings3Line, RiTerminalBoxLine, type RemixiconComponentType } from '@remixicon/react';
+import { RiArrowLeftSLine, RiChat4Line, RiCheckLine, RiCloseLine, RiCommandLine, RiFileTextLine, RiFolder6Line, RiGitBranchLine, RiGithubFill, RiLayoutLeftLine, RiPlayListAddLine, RiQuestionLine, RiRefreshLine, RiSettings3Line, RiTerminalBoxLine, RiTimerLine, type RemixiconComponentType } from '@remixicon/react';
+import { DiffIcon } from '@/components/icons/DiffIcon';
 import { useUIStore, type MainTab } from '@/stores/useUIStore';
 import { useUpdateStore } from '@/stores/useUpdateStore';
 import { useConfigStore } from '@/stores/useConfigStore';
 import { useSessionStore } from '@/stores/useSessionStore';
+import { useQuotaAutoRefresh, useQuotaStore } from '@/stores/useQuotaStore';
 import { useDirectoryStore } from '@/stores/useDirectoryStore';
 import { useGitHubAuthStore } from '@/stores/useGitHubAuthStore';
 import { useRuntimeAPIs } from '@/hooks/useRuntimeAPIs';
@@ -26,7 +28,24 @@ import { useDeviceInfo } from '@/lib/device';
 import { cn, getModifierLabel, hasModifier } from '@/lib/utils';
 import { useDiffFileCount } from '@/components/views/DiffView';
 import { McpDropdown } from '@/components/mcp/McpDropdown';
+import { ProviderLogo } from '@/components/ui/ProviderLogo';
+import { formatPercent, formatWindowLabel, QUOTA_PROVIDERS } from '@/lib/quota';
+import { UsageProgressBar } from '@/components/sections/usage/UsageProgressBar';
+import { updateDesktopSettings } from '@/lib/persistence';
+import type { UsageWindow } from '@/types';
 import type { GitHubAuthStatus } from '@/lib/api/types';
+
+const formatTime = (timestamp: number | null) => {
+  if (!timestamp) return '-';
+  try {
+    return new Date(timestamp).toLocaleTimeString(undefined, {
+      hour: 'numeric',
+      minute: '2-digit',
+    });
+  } catch {
+    return '-';
+  }
+};
 
 const normalize = (value: string): string => {
   if (!value) return '';
@@ -64,7 +83,7 @@ const resolveTilde = (path: string, homeDir: string | null): string => {
 interface TabConfig {
   id: MainTab;
   label: string;
-  icon: RemixiconComponentType;
+  icon: RemixiconComponentType | 'diff';
   badge?: number;
   showDot?: boolean;
 }
@@ -84,6 +103,14 @@ export const Header: React.FC = () => {
   const getContextUsage = useSessionStore((state) => state.getContextUsage);
   const currentSessionId = useSessionStore((state) => state.currentSessionId);
   const sessions = useSessionStore((state) => state.sessions);
+  const quotaResults = useQuotaStore((state) => state.results);
+  const fetchAllQuotas = useQuotaStore((state) => state.fetchAllQuotas);
+  const isQuotaLoading = useQuotaStore((state) => state.isLoading);
+  const quotaLastUpdated = useQuotaStore((state) => state.lastUpdated);
+  const quotaDisplayMode = useQuotaStore((state) => state.displayMode);
+  const dropdownProviderIds = useQuotaStore((state) => state.dropdownProviderIds);
+  const loadQuotaSettings = useQuotaStore((state) => state.loadSettings);
+  const setQuotaDisplayMode = useQuotaStore((state) => state.setDisplayMode);
   const homeDirectory = useDirectoryStore((state) => state.homeDirectory);
   const { isMobile } = useDeviceInfo();
   const diffFileCount = useDiffFileCount();
@@ -152,6 +179,41 @@ export const Header: React.FC = () => {
   const githubLogin = githubAuthStatus?.connected ? githubAuthStatus.user?.login : null;
   const githubAccounts = githubAuthStatus?.accounts ?? [];
   const [isSwitchingGitHubAccount, setIsSwitchingGitHubAccount] = React.useState(false);
+  const [isMobileRateLimitsOpen, setIsMobileRateLimitsOpen] = React.useState(false);
+  useQuotaAutoRefresh();
+  const rateLimitGroups = React.useMemo(() => {
+    const groups: Array<{
+      providerId: string;
+      providerName: string;
+      entries: Array<[string, UsageWindow]>;
+    }> = [];
+
+    for (const provider of QUOTA_PROVIDERS) {
+      if (!dropdownProviderIds.includes(provider.id)) {
+        continue;
+      }
+      const result = quotaResults.find((entry) => entry.providerId === provider.id);
+      const windows = (result?.usage?.windows ?? {}) as Record<string, UsageWindow>;
+      const entries = Object.entries(windows);
+      if (entries.length > 0) {
+        groups.push({ providerId: provider.id, providerName: provider.name, entries });
+      }
+    }
+
+    return groups;
+  }, [dropdownProviderIds, quotaResults]);
+  const hasRateLimits = rateLimitGroups.length > 0;
+  React.useEffect(() => {
+    void loadQuotaSettings();
+  }, [loadQuotaSettings]);
+  const handleDisplayModeChange = React.useCallback(async (mode: 'usage' | 'remaining') => {
+    setQuotaDisplayMode(mode);
+    try {
+      await updateDesktopSettings({ usageDisplayMode: mode });
+    } catch (error) {
+      console.warn('Failed to update usage display mode:', error);
+    }
+  }, [setQuotaDisplayMode]);
 
   const currentSession = React.useMemo(() => {
     if (!currentSessionId) return null;
@@ -175,22 +237,22 @@ export const Header: React.FC = () => {
       const payload = runtimeApis.github
         ? await runtimeApis.github.authActivate(accountId)
         : await (async () => {
-            const response = await fetch('/api/github/auth/activate', {
-              method: 'POST',
-              headers: {
-                'Content-Type': 'application/json',
-                Accept: 'application/json',
-              },
-              body: JSON.stringify({ accountId }),
-            });
-            const body = (await response.json().catch(() => null)) as
-              | (GitHubAuthStatus & { error?: string })
-              | null;
-            if (!response.ok || !body) {
-              throw new Error(body?.error || response.statusText);
-            }
-            return body;
-          })();
+          const response = await fetch('/api/github/auth/activate', {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+              Accept: 'application/json',
+            },
+            body: JSON.stringify({ accountId }),
+          });
+          const body = (await response.json().catch(() => null)) as
+            | (GitHubAuthStatus & { error?: string })
+            | null;
+          if (!response.ok || !body) {
+            throw new Error(body?.error || response.statusText);
+          }
+          return body;
+        })();
 
       setGitHubAuthStatus(payload);
     } catch (error) {
@@ -304,7 +366,7 @@ export const Header: React.FC = () => {
     setSettingsDialogOpen(true);
   }, [blurActiveElement, isMobile, setSessionSwitcherOpen, setSettingsDialogOpen]);
 
-  const headerIconButtonClass = 'app-region-no-drag inline-flex h-9 w-9 items-center justify-center gap-2 p-2 rounded-md typography-ui-label font-medium text-muted-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary disabled:pointer-events-none disabled:opacity-50 hover:text-foreground hover:bg-secondary/50 transition-colors';
+  const headerIconButtonClass = 'app-region-no-drag inline-flex h-9 w-9 items-center justify-center gap-2 p-2 rounded-md typography-ui-label font-medium text-muted-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary disabled:pointer-events-none disabled:opacity-50 hover:text-foreground hover:bg-interactive-hover transition-colors';
 
   const desktopPaddingClass = React.useMemo(() => {
     if (isDesktopApp && isMacPlatform) {
@@ -347,7 +409,7 @@ export const Header: React.FC = () => {
 
     const node = headerRef.current;
     if (!node || typeof ResizeObserver === 'undefined') {
-      return () => {};
+      return () => { };
     }
 
     const observer = new ResizeObserver(() => {
@@ -415,7 +477,7 @@ export const Header: React.FC = () => {
       {
         id: 'diff',
         label: 'Diff',
-        icon: RiCodeLine,
+        icon: 'diff',
         badge: !isMobile && diffFileCount > 0 ? diffFileCount : undefined,
       },
       { id: 'files', label: 'Files', icon: RiFolder6Line },
@@ -447,18 +509,34 @@ export const Header: React.FC = () => {
 
   const renderTab = (tab: TabConfig) => {
     const isActive = activeMainTab === tab.id;
-    const Icon = tab.icon;
+    const isDiffTab = tab.icon === 'diff';
+    const Icon = isDiffTab ? null : (tab.icon as RemixiconComponentType);
     const isChatTab = tab.id === 'chat';
+    const showContextTooltip = isChatTab && !isMobile && contextUsage && contextUsage.totalTokens > 0;
 
-    return (
+    const renderIcon = (iconSize: number) => {
+      if (isDiffTab) {
+        return <DiffIcon size={iconSize} />;
+      }
+      return Icon ? <Icon size={iconSize} /> : null;
+    };
+
+    const formatTokens = (tokens: number) => {
+      if (tokens >= 1_000_000) return `${(tokens / 1_000_000).toFixed(1)}M`;
+      if (tokens >= 1_000) return `${(tokens / 1_000).toFixed(1)}K`;
+      return tokens.toFixed(1).replace(/\.0$/, '');
+    };
+
+    const tabButton = (
       <button
-        key={tab.id}
         type="button"
         onClick={() => setActiveMainTab(tab.id)}
         onMouseDown={isActive ? handleActiveTabDragStart : undefined}
         className={cn(
           'relative flex h-8 items-center gap-2 px-3 rounded-md typography-ui-label font-medium transition-colors',
-          isActive ? 'app-region-drag bg-secondary text-foreground shadow-sm' : 'app-region-no-drag text-muted-foreground hover:bg-secondary/50 hover:text-foreground',
+          isActive
+            ? 'app-region-drag bg-interactive-selection text-interactive-selection-foreground shadow-sm'
+            : 'app-region-no-drag text-muted-foreground hover:bg-interactive-hover/50 hover:text-foreground',
           'focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary',
           isChatTab && !isMobile && 'min-w-[100px] justify-center'
         )}
@@ -467,33 +545,57 @@ export const Header: React.FC = () => {
         role="tab"
       >
         {isMobile ? (
-          <Icon size={20} />
+          renderIcon(20)
         ) : (
           <>
-            <Icon size={16} />
+            {renderIcon(16)}
             <span className="header-tab-label">{tab.label}</span>
           </>
         )}
 
-        {isChatTab && !isMobile && contextUsage && contextUsage.totalTokens > 0 && (
-          <span className="ml-1">
-            <ContextUsageDisplay
-              totalTokens={contextUsage.totalTokens}
-              percentage={contextUsage.percentage}
-              contextLimit={contextUsage.contextLimit}
-              outputLimit={contextUsage.outputLimit ?? 0}
-              size="compact"
-            />
+        {showContextTooltip && (
+          <span className="header-tab-badge">
+            <div className={cn(
+              'app-region-no-drag flex items-center gap-1.5 text-muted-foreground/60 select-none typography-micro',
+            )}>
+              <span className={cn(
+                'font-medium',
+                contextUsage.percentage >= 90 ? 'text-status-error' :
+                  contextUsage.percentage >= 75 ? 'text-status-warning' : 'text-status-success'
+              )}>
+                {Math.min(contextUsage.percentage, 999).toFixed(1)}%
+              </span>
+            </div>
           </span>
         )}
 
         {tab.badge !== undefined && tab.badge > 0 && (
-          <span className="ml-1 flex h-4 min-w-4 items-center justify-center rounded-full bg-primary/10 px-1 text-[10px] font-bold text-primary">
+          <span className="header-tab-badge typography-micro text-status-info font-medium">
             {tab.badge}
           </span>
         )}
       </button>
     );
+
+    if (showContextTooltip) {
+      const safeOutputLimit = typeof contextUsage.outputLimit === 'number' ? Math.max(contextUsage.outputLimit, 0) : 0;
+      return (
+        <Tooltip key={tab.id} delayDuration={1000}>
+          <TooltipTrigger asChild>
+            {tabButton}
+          </TooltipTrigger>
+          <TooltipContent>
+            <div className="space-y-0.5">
+              <p className="typography-micro leading-tight">Used tokens: {formatTokens(contextUsage.totalTokens)}</p>
+              <p className="typography-micro leading-tight">Context limit: {formatTokens(contextUsage.contextLimit)}</p>
+              <p className="typography-micro leading-tight">Output limit: {formatTokens(safeOutputLimit)}</p>
+            </div>
+          </TooltipContent>
+        </Tooltip>
+      );
+    }
+
+    return <React.Fragment key={tab.id}>{tabButton}</React.Fragment>;
   };
 
   const renderDesktop = () => (
@@ -522,24 +624,154 @@ export const Header: React.FC = () => {
 
       <div className="flex-1" />
 
-       <div className="flex items-center gap-1 pr-3">
-         <Tooltip delayDuration={500}>
-           <TooltipTrigger asChild>
-             <button
-               type="button"
-               onClick={toggleCommandPalette}
-               aria-label="Open command palette"
-               className={headerIconButtonClass}
-             >
-               <RiCommandLine className="h-5 w-5" />
-             </button>
-           </TooltipTrigger>
-           <TooltipContent>
-             <p>Command Palette ({getModifierLabel()}+K)</p>
-           </TooltipContent>
-         </Tooltip>
+      <div className="flex items-center gap-1 pr-3">
+        <Tooltip delayDuration={500}>
+          <TooltipTrigger asChild>
+            <button
+              type="button"
+              onClick={toggleCommandPalette}
+              aria-label="Open command palette"
+              className={headerIconButtonClass}
+            >
+              <RiCommandLine className="h-5 w-5" />
+            </button>
+          </TooltipTrigger>
+          <TooltipContent>
+            <p>Command Palette ({getModifierLabel()}+K)</p>
+          </TooltipContent>
+        </Tooltip>
 
-         <McpDropdown headerIconButtonClass={headerIconButtonClass} />
+        <DropdownMenu onOpenChange={(open) => {
+          if (open && quotaResults.length === 0) {
+            fetchAllQuotas();
+          }
+        }}>
+          <Tooltip delayDuration={500}>
+            <TooltipTrigger asChild>
+              <DropdownMenuTrigger asChild>
+                <button
+                  type="button"
+                  aria-label="View rate limits"
+                  className={headerIconButtonClass}
+                  disabled={isQuotaLoading}
+                >
+                  <RiTimerLine className="h-5 w-5" />
+                </button>
+              </DropdownMenuTrigger>
+            </TooltipTrigger>
+            <TooltipContent>
+              <p>Rate limits</p>
+            </TooltipContent>
+          </Tooltip>
+            <DropdownMenuContent align="end" className="w-80 max-h-[70vh] overflow-y-auto overflow-x-hidden p-0">
+              <div className="sticky top-0 z-20 bg-[var(--surface-elevated)] border-b border-[var(--interactive-border)]">
+              <DropdownMenuLabel className="flex items-center justify-between gap-3 typography-ui-header font-semibold text-foreground">
+                <span>Rate limits</span>
+                <div className="flex items-center gap-1">
+                  <div className="flex items-center rounded-md border border-[var(--interactive-border)] p-0.5">
+                    <button
+                      type="button"
+                      className={cn(
+                        'px-2 py-0.5 rounded-sm typography-micro text-[10px] transition-colors',
+                        quotaDisplayMode === 'usage'
+                          ? 'bg-interactive-selection text-interactive-selection-foreground'
+                          : 'text-muted-foreground hover:text-foreground'
+                      )}
+                      onClick={() => handleDisplayModeChange('usage')}
+                      aria-label="Show used quota"
+                    >
+                      Used
+                    </button>
+                    <button
+                      type="button"
+                      className={cn(
+                        'px-2 py-0.5 rounded-sm typography-micro text-[10px] transition-colors',
+                        quotaDisplayMode === 'remaining'
+                          ? 'bg-interactive-selection text-interactive-selection-foreground'
+                          : 'text-muted-foreground hover:text-foreground'
+                      )}
+                      onClick={() => handleDisplayModeChange('remaining')}
+                      aria-label="Show remaining quota"
+                    >
+                      Remaining
+                    </button>
+                  </div>
+                  <button
+                    type="button"
+                    className={cn(
+                      'inline-flex h-7 w-7 items-center justify-center rounded-md text-muted-foreground transition-colors',
+                      'hover:text-foreground hover:bg-interactive-hover',
+                      'focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary'
+                    )}
+                    onClick={() => fetchAllQuotas()}
+                    disabled={isQuotaLoading}
+                    aria-label="Refresh rate limits"
+                  >
+                    <RiRefreshLine className="h-4 w-4" />
+                  </button>
+                </div>
+              </DropdownMenuLabel>
+              <div className="px-2 pb-2 typography-micro text-muted-foreground text-[10px]">
+                Last updated {formatTime(quotaLastUpdated)}
+              </div>
+            </div>
+            {!hasRateLimits && (
+              <DropdownMenuItem className="cursor-default" onSelect={(event) => event.preventDefault()}>
+                <span className="typography-ui-label text-muted-foreground">No rate limits available.</span>
+              </DropdownMenuItem>
+            )}
+            {rateLimitGroups.map((group, index) => (
+              <React.Fragment key={group.providerId}>
+                <DropdownMenuLabel className="sticky top-[60px] z-10 flex items-center gap-2 bg-[var(--surface-elevated)] typography-ui-label text-foreground">
+                  <ProviderLogo providerId={group.providerId} className="h-4 w-4" />
+                  {group.providerName}
+                </DropdownMenuLabel>
+                {group.entries.length === 0 ? (
+                  <DropdownMenuItem
+                    key={`${group.providerId}-empty`}
+                    className="cursor-default"
+                    onSelect={(event) => event.preventDefault()}
+                  >
+                    <span className="typography-ui-label text-muted-foreground">No rate limits reported.</span>
+                  </DropdownMenuItem>
+                ) : (
+                  group.entries.map(([label, window]) => (
+                    <DropdownMenuItem
+                      key={`${group.providerId}-${label}`}
+                      className="cursor-default items-start"
+                      onSelect={(event) => event.preventDefault()}
+                    >
+                      <span className="flex min-w-0 flex-1 flex-col gap-2">
+                        {(() => {
+                          const displayPercent = quotaDisplayMode === 'remaining'
+                            ? window.remainingPercent
+                            : window.usedPercent;
+                          return (
+                            <>
+                              <span className="flex min-w-0 items-center justify-between gap-3">
+                                <span className="truncate typography-micro text-muted-foreground">{formatWindowLabel(label)}</span>
+                                <span className="typography-ui-label text-foreground tabular-nums">
+                                  {formatPercent(displayPercent) === '-' ? '' : formatPercent(displayPercent)}
+                                </span>
+                              </span>
+                              <UsageProgressBar percent={displayPercent} tonePercent={window.usedPercent} className="h-1" />
+                              <span className="flex items-center justify-between typography-micro text-muted-foreground text-[10px]">
+                                <span>{window.resetAfterFormatted ?? window.resetAtFormatted ?? ''}</span>
+                              </span>
+                            </>
+                          );
+                        })()}
+                      </span>
+                    </DropdownMenuItem>
+                  ))
+                )}
+                {index < rateLimitGroups.length - 1 && <DropdownMenuSeparator />}
+              </React.Fragment>
+            ))}
+          </DropdownMenuContent>
+        </DropdownMenu>
+
+        <McpDropdown headerIconButtonClass={headerIconButtonClass} />
 
         <Tooltip delayDuration={500}>
           <TooltipTrigger asChild>
@@ -662,7 +894,7 @@ export const Header: React.FC = () => {
         {isSessionSwitcherOpen ? (
           <button
             onClick={() => setSessionSwitcherOpen(false)}
-            className="app-region-no-drag h-9 w-9 p-2 text-muted-foreground hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary rounded-md active:bg-secondary"
+            className="app-region-no-drag h-9 w-9 p-2 text-muted-foreground hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary rounded-md active:bg-interactive-active"
             aria-label="Back"
           >
             <RiArrowLeftSLine className="h-5 w-5" />
@@ -670,7 +902,7 @@ export const Header: React.FC = () => {
         ) : (
           <button
             onClick={handleOpenSessionSwitcher}
-            className="app-region-no-drag h-9 w-9 p-2 text-muted-foreground hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary rounded-md active:bg-secondary"
+            className="app-region-no-drag h-9 w-9 p-2 text-muted-foreground hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary rounded-md active:bg-interactive-active"
             aria-label="Open sessions"
           >
             <RiPlayListAddLine className="h-5 w-5" />
@@ -697,7 +929,8 @@ export const Header: React.FC = () => {
           <div className="flex items-center gap-0.5" role="tablist" aria-label="Main navigation">
             {tabs.map((tab) => {
               const isActive = activeMainTab === tab.id;
-              const Icon = tab.icon;
+              const isDiffTab = tab.icon === 'diff';
+              const Icon = isDiffTab ? null : (tab.icon as RemixiconComponentType);
               return (
                 <Tooltip key={tab.id} delayDuration={500}>
                   <TooltipTrigger asChild>
@@ -715,10 +948,14 @@ export const Header: React.FC = () => {
                       className={cn(
                         headerIconButtonClass,
                         'relative',
-                        isActive && 'text-foreground bg-secondary'
+                        isActive && 'bg-interactive-selection text-interactive-selection-foreground'
                       )}
                     >
-                      <Icon className="h-5 w-5" />
+                      {isDiffTab ? (
+                        <DiffIcon className="h-5 w-5" />
+                      ) : Icon ? (
+                        <Icon className="h-5 w-5" />
+                      ) : null}
                       {tab.badge !== undefined && tab.badge > 0 && (
                         <span className="absolute -top-1 -right-1 text-[10px] font-semibold text-primary">
                           {tab.badge}
@@ -741,6 +978,137 @@ export const Header: React.FC = () => {
           </div>
 
           <McpDropdown headerIconButtonClass={headerIconButtonClass} />
+
+          <DropdownMenu
+            open={isMobileRateLimitsOpen}
+            onOpenChange={(open) => {
+              setIsMobileRateLimitsOpen(open);
+              if (open && quotaResults.length === 0) {
+                fetchAllQuotas();
+              }
+            }}
+          >
+            <Tooltip delayDuration={500}>
+              <TooltipTrigger asChild>
+                <DropdownMenuTrigger asChild>
+                  <button
+                    type="button"
+                    aria-label="View rate limits"
+                    className={headerIconButtonClass}
+                    disabled={isQuotaLoading}
+                  >
+                    <RiTimerLine className="h-5 w-5" />
+                  </button>
+                </DropdownMenuTrigger>
+              </TooltipTrigger>
+              <TooltipContent>
+                <p>Rate limits</p>
+              </TooltipContent>
+            </Tooltip>
+            <DropdownMenuContent
+              align="end"
+              sideOffset={0}
+              className="h-[100vh] w-[100vw] max-h-none rounded-none border-0 p-0"
+            >
+              <div className="flex h-full flex-col bg-[var(--surface-elevated)]">
+                <div className="sticky top-0 z-20 border-b border-[var(--interactive-border)] bg-[var(--surface-elevated)]">
+                  <div className="flex items-center justify-between gap-2 px-3 py-3">
+                    <span className="typography-ui-header font-semibold text-foreground">Rate limits</span>
+                    <div className="flex items-center gap-2">
+                      <div className="flex items-center rounded-md border border-[var(--interactive-border)] p-0.5">
+                        <button
+                          type="button"
+                          className={cn(
+                            'px-1.5 py-0.5 rounded-sm typography-micro text-[9px] transition-colors',
+                            quotaDisplayMode === 'usage'
+                              ? 'bg-interactive-selection text-interactive-selection-foreground'
+                              : 'text-muted-foreground hover:text-foreground'
+                          )}
+                          onClick={() => handleDisplayModeChange('usage')}
+                          aria-label="Show used quota"
+                        >
+                          Used
+                        </button>
+                        <button
+                          type="button"
+                          className={cn(
+                            'px-1.5 py-0.5 rounded-sm typography-micro text-[9px] transition-colors',
+                            quotaDisplayMode === 'remaining'
+                              ? 'bg-interactive-selection text-interactive-selection-foreground'
+                              : 'text-muted-foreground hover:text-foreground'
+                          )}
+                          onClick={() => handleDisplayModeChange('remaining')}
+                          aria-label="Show remaining quota"
+                        >
+                          Remaining
+                        </button>
+                      </div>
+                      <button
+                        type="button"
+                        className={cn(
+                          'inline-flex h-8 w-8 items-center justify-center rounded-md text-muted-foreground transition-colors',
+                          'hover:text-foreground hover:bg-interactive-hover',
+                          'focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary'
+                        )}
+                        onClick={() => fetchAllQuotas()}
+                        disabled={isQuotaLoading}
+                        aria-label="Refresh rate limits"
+                      >
+                        <RiRefreshLine className="h-4 w-4" />
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => setIsMobileRateLimitsOpen(false)}
+                        className="inline-flex h-8 w-8 items-center justify-center rounded-md text-muted-foreground hover:text-foreground hover:bg-interactive-hover"
+                        aria-label="Close rate limits"
+                      >
+                        <RiCloseLine className="h-5 w-5" />
+                      </button>
+                    </div>
+                  </div>
+                  <div className="px-3 pb-3 typography-micro text-muted-foreground text-[10px]">
+                    Last updated {formatTime(quotaLastUpdated)}
+                  </div>
+                </div>
+                <div className="flex-1 overflow-y-auto overflow-x-hidden">
+                  {!hasRateLimits && (
+                    <div className="px-3 py-4 typography-ui-label text-muted-foreground">
+                      No rate limits available.
+                    </div>
+                  )}
+                  {rateLimitGroups.map((group) => (
+                    <React.Fragment key={group.providerId}>
+                      <div className="sticky top-0 z-10 flex items-center gap-2 bg-[var(--surface-elevated)] px-3 py-2">
+                        <ProviderLogo providerId={group.providerId} className="h-4 w-4" />
+                        <span className="typography-ui-label text-foreground">{group.providerName}</span>
+                      </div>
+                      {group.entries.map(([label, window]) => {
+                        const displayPercent = quotaDisplayMode === 'remaining'
+                          ? window.remainingPercent
+                          : window.usedPercent;
+                        return (
+                          <div key={`${group.providerId}-${label}`} className="px-3 py-2">
+                            <div className="flex items-center justify-between gap-3">
+                              <span className="truncate typography-micro text-muted-foreground">
+                                {formatWindowLabel(label)}
+                              </span>
+                              <span className="typography-ui-label text-foreground tabular-nums">
+                                {formatPercent(displayPercent)}
+                              </span>
+                            </div>
+                            <UsageProgressBar percent={displayPercent} tonePercent={window.usedPercent} className="mt-2 h-1" />
+                            <div className="mt-1 typography-micro text-muted-foreground text-[10px]">
+                              {window.resetAfterFormatted ?? window.resetAtFormatted ?? ''}
+                            </div>
+                          </div>
+                        );
+                      })}
+                    </React.Fragment>
+                  ))}
+                </div>
+              </div>
+            </DropdownMenuContent>
+          </DropdownMenu>
 
           <Tooltip delayDuration={500}>
             <TooltipTrigger asChild>

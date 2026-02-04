@@ -3,6 +3,7 @@ import type { ComponentType } from 'react';
 import {
     RiAiAgentLine,
     RiArrowDownSLine,
+    RiArrowGoBackLine,
     RiArrowRightSLine,
     RiBrainAi3Line,
     RiCheckLine,
@@ -270,6 +271,7 @@ export const ModelControls: React.FC<ModelControlsProps> = ({
         currentVariant,
         currentAgentName,
         settingsDefaultVariant,
+        settingsDefaultAgent,
         setProvider,
         setModel,
         setCurrentVariant,
@@ -336,6 +338,9 @@ export const ModelControls: React.FC<ModelControlsProps> = ({
         isModelSelectorOpen,
         setModelSelectorOpen,
     } = useUIStore();
+
+    // Separate state for agent selector to avoid conflict with model selector
+    const [isAgentSelectorOpen, setIsAgentSelectorOpen] = React.useState(false);
     const { favoriteModelsList, recentModelsList } = useModelLists();
 
     const { isMobile } = useDeviceInfo();
@@ -385,12 +390,13 @@ export const ModelControls: React.FC<ModelControlsProps> = ({
         }
     }, [activeMobilePanel]);
 
-    const prevAgentMenuOpenRef = React.useRef(agentMenuOpen);
+    // Handle model selector close behavior (separate from agent selector)
+    const prevModelSelectorOpenRef = React.useRef(isModelSelectorOpen);
     React.useEffect(() => {
-        const wasOpen = prevAgentMenuOpenRef.current;
-        prevAgentMenuOpenRef.current = agentMenuOpen;
+        const wasOpen = prevModelSelectorOpenRef.current;
+        prevModelSelectorOpenRef.current = isModelSelectorOpen;
 
-        if (!agentMenuOpen) {
+        if (!isModelSelectorOpen) {
             setDesktopModelQuery('');
             setModelSelectedIndex(0);
 
@@ -402,12 +408,47 @@ export const ModelControls: React.FC<ModelControlsProps> = ({
                 });
             }
         }
-    }, [agentMenuOpen, isCompact]);
+    }, [isModelSelectorOpen, isCompact]);
+
+    // Handle agent selector close behavior
+    const [agentSearchQuery, setAgentSearchQuery] = React.useState('');
+    React.useEffect(() => {
+        if (!isAgentSelectorOpen) {
+            setAgentSearchQuery('');
+            if (!isCompact) {
+                requestAnimationFrame(() => {
+                    const textarea = document.querySelector<HTMLTextAreaElement>('textarea[data-chat-input="true"]');
+                    textarea?.focus();
+                });
+            }
+        }
+    }, [isAgentSelectorOpen, isCompact]);
 
     // Reset selected index when search query changes
     React.useEffect(() => {
         setModelSelectedIndex(0);
     }, [desktopModelQuery]);
+
+    const sortedAndFilteredAgents = React.useMemo(() => {
+        const sorted = [...agents].sort((a, b) => a.name.localeCompare(b.name));
+        if (!agentSearchQuery.trim()) {
+            return sorted;
+        }
+        return sorted.filter((agent) =>
+            fuzzyMatch(agentSearchQuery, agent.name) ||
+            (agent.description && fuzzyMatch(agentSearchQuery, agent.description))
+        );
+    }, [agents, agentSearchQuery]);
+
+    const defaultAgentName = React.useMemo(() => {
+        if (settingsDefaultAgent) {
+            const found = agents.find(a => a.name === settingsDefaultAgent);
+            if (found) return found.name;
+        }
+        const buildAgent = agents.find(a => a.name === 'build');
+        if (buildAgent) return buildAgent.name;
+        return agents[0]?.name;
+    }, [settingsDefaultAgent, agents]);
 
     const currentAgent = React.useMemo(() => {
         if (uiAgentName) {
@@ -1371,7 +1412,7 @@ export const ModelControls: React.FC<ModelControlsProps> = ({
                                 value={mobileModelQuery}
                                 onChange={(event) => setMobileModelQuery(event.target.value)}
                                 placeholder="Search providers or models"
-                                className="pl-7 h-9 rounded-xl border-border/40 bg-background/95 typography-meta"
+                                className="pl-7 h-9 rounded-xl border-border/40 bg-[var(--surface-elevated)] typography-meta"
                             />
                             {mobileModelQuery && (
                                 <button
@@ -1394,7 +1435,7 @@ export const ModelControls: React.FC<ModelControlsProps> = ({
 
                     {/* Favorites Section for Mobile */}
                     {!mobileModelQuery && favoriteModelsList.length > 0 && (
-                        <div className="rounded-xl border border-border/40 bg-background/95 overflow-hidden">
+                        <div className="rounded-xl border border-border/40 bg-[var(--surface-elevated)] overflow-hidden">
                             <div className="px-2 py-1.5 text-xs font-semibold text-muted-foreground uppercase tracking-wider">
                                 <RiStarFill className="h-3 w-3 inline-block mr-1.5 text-primary" />
                                 Favorites
@@ -1413,7 +1454,7 @@ export const ModelControls: React.FC<ModelControlsProps> = ({
                                                 'flex w-full items-start gap-2 border-b border-border/30 px-2 py-1.5 text-left last:border-b-0',
                                                 'focus:outline-none focus-visible:ring-1 focus-visible:ring-primary',
                                                 'first:rounded-t-xl last:rounded-b-xl transition-colors',
-                                                isSelected ? 'bg-primary/15 text-primary' : 'hover:bg-muted'
+                                                 isSelected ? 'bg-interactive-selection/15 text-interactive-selection-foreground' : 'hover:bg-interactive-hover'
                                             )}
                                         >
                                             <div className="flex items-center gap-2 min-w-0">
@@ -1440,7 +1481,7 @@ export const ModelControls: React.FC<ModelControlsProps> = ({
 
                     {/* Recent Section for Mobile */}
                     {!mobileModelQuery && recentModelsList.length > 0 && (
-                        <div className="rounded-xl border border-border/40 bg-background/95 overflow-hidden">
+                        <div className="rounded-xl border border-border/40 bg-[var(--surface-elevated)] overflow-hidden">
                             <div className="px-2 py-1.5 text-xs font-semibold text-muted-foreground uppercase tracking-wider">
                                 <RiTimeLine className="h-3 w-3 inline-block mr-1.5" />
                                 Recent
@@ -1459,7 +1500,7 @@ export const ModelControls: React.FC<ModelControlsProps> = ({
                                                 'flex w-full items-start gap-2 border-b border-border/30 px-2 py-1.5 text-left last:border-b-0',
                                                 'focus:outline-none focus-visible:ring-1 focus-visible:ring-primary',
                                                 'first:rounded-t-xl last:rounded-b-xl transition-colors',
-                                                isSelected ? 'bg-primary/15 text-primary' : 'hover:bg-muted'
+                                                 isSelected ? 'bg-interactive-selection/15 text-interactive-selection-foreground' : 'hover:bg-interactive-hover'
                                             )}
                                         >
                                             <div className="flex items-center gap-2 min-w-0">
@@ -1492,8 +1533,8 @@ export const ModelControls: React.FC<ModelControlsProps> = ({
                         const isActiveProvider = provider.id === currentProviderId;
                         const isExpanded = expandedMobileProviders.has(provider.id) || normalizedQuery.length > 0;
 
-                        return (
-                            <div key={provider.id} className="rounded-xl border border-border/40 bg-background/95 overflow-hidden">
+                         return (
+                             <div key={provider.id} className="rounded-xl border border-border/40 bg-[var(--surface-elevated)] overflow-hidden">
                                 <button
                                     type="button"
                                     onClick={() => toggleMobileProviderExpansion(provider.id)}
@@ -1533,9 +1574,9 @@ export const ModelControls: React.FC<ModelControlsProps> = ({
                                                     className={cn(
                                                         'flex w-full items-start gap-2 border-b border-border/30 px-2 py-1.5 last:border-b-0',
                                                         'rounded-lg transition-colors',
-                                                        !isSelected && 'hover:bg-muted',
+                                                        !isSelected && 'hover:bg-interactive-hover',
                                                         isSelected
-                                                            ? 'bg-primary/15 text-primary'
+                                                            ? 'bg-interactive-selection/15 text-interactive-selection-foreground'
                                                             : ''
                                                     )}
                                                 >
@@ -1584,9 +1625,9 @@ export const ModelControls: React.FC<ModelControlsProps> = ({
                                                             toggleFavoriteModel(provider.id as string, model.id as string);
                                                         }}
                                                         className={cn(
-                                                            "model-favorite-button flex h-5 w-5 items-center justify-center hover:text-yellow-600 flex-shrink-0",
+                                                            "model-favorite-button flex h-5 w-5 items-center justify-center hover:text-primary/80 flex-shrink-0",
                                                             isFavoriteModel(provider.id as string, model.id as string)
-                                                                ? "text-yellow-500"
+                                                                ? "text-primary"
                                                                 : "text-muted-foreground"
                                                         )}
                                                         aria-label={isFavoriteModel(provider.id as string, model.id as string) ? "Unfavorite" : "Favorite"}
@@ -1857,7 +1898,7 @@ export const ModelControls: React.FC<ModelControlsProps> = ({
                 ref={(el) => { modelItemRefs.current[flatIndex] = el; }}
                 className={cn(
                     "typography-meta group flex items-center gap-2 px-2 py-1.5 rounded-md cursor-pointer",
-                    isHighlighted ? "bg-accent" : "hover:bg-accent/50"
+                     isHighlighted ? "bg-interactive-selection" : "hover:bg-interactive-hover/50"
                 )}
                 onClick={() => handleProviderAndModelChange(providerID, modelID)}
                 onMouseEnter={() => setModelSelectedIndex(flatIndex)}
@@ -1901,8 +1942,8 @@ export const ModelControls: React.FC<ModelControlsProps> = ({
                             toggleFavoriteModel(providerID, modelID);
                         }}
                         className={cn(
-                            "model-favorite-button flex h-4 w-4 items-center justify-center hover:text-yellow-600",
-                            isFavorite ? "text-yellow-500" : "text-muted-foreground"
+                            "model-favorite-button flex h-4 w-4 items-center justify-center hover:text-primary/80",
+                            isFavorite ? "text-primary" : "text-muted-foreground"
                         )}
                         aria-label={isFavorite ? "Unfavorite" : "Favorite"}
                         title={isFavorite ? "Remove from favorites" : "Add to favorites"}
@@ -2021,7 +2062,7 @@ export const ModelControls: React.FC<ModelControlsProps> = ({
                             <DropdownMenuTrigger asChild>
                                 <div
                                     className={cn(
-                                        'model-controls__model-trigger flex items-center gap-1.5 cursor-pointer hover:opacity-70 min-w-0',
+                                        'model-controls__model-trigger flex items-center gap-1.5 cursor-pointer hover:bg-transparent hover:opacity-70 min-w-0',
                                         buttonHeight
                                     )}
                                 >
@@ -2082,7 +2123,10 @@ export const ModelControls: React.FC<ModelControlsProps> = ({
                                     {/* Favorites Section */}
                                     {filteredFavorites.length > 0 && (
                                         <>
-                                            <DropdownMenuLabel className="typography-micro font-semibold text-muted-foreground uppercase tracking-wider flex items-center gap-2 -mx-1 px-3 py-1.5 sticky top-0 z-10 bg-background border-b border-border/30">
+                                            <DropdownMenuLabel
+                                                style={{ backgroundColor: 'var(--surface-elevated)' }}
+                                                className="typography-micro font-semibold text-muted-foreground uppercase tracking-wider flex items-center gap-2 -mx-1 px-3 py-1.5 sticky top-0 z-10 border-b border-border/30"
+                                            >
                                                 <RiStarFill className="h-4 w-4 text-primary" />
                                                 Favorites
                                             </DropdownMenuLabel>
@@ -2097,7 +2141,10 @@ export const ModelControls: React.FC<ModelControlsProps> = ({
                                     {filteredRecents.length > 0 && (
                                         <>
                                             {filteredFavorites.length > 0 && <DropdownMenuSeparator />}
-                                            <DropdownMenuLabel className="typography-micro font-semibold text-muted-foreground uppercase tracking-wider flex items-center gap-2 -mx-1 px-3 py-1.5 sticky top-0 z-10 bg-background border-b border-border/30">
+                                            <DropdownMenuLabel
+                                                style={{ backgroundColor: 'var(--surface-elevated)' }}
+                                                className="typography-micro font-semibold text-muted-foreground uppercase tracking-wider flex items-center gap-2 -mx-1 px-3 py-1.5 sticky top-0 z-10 border-b border-border/30"
+                                            >
                                                 <RiTimeLine className="h-4 w-4" />
                                                 Recent
                                             </DropdownMenuLabel>
@@ -2117,7 +2164,10 @@ export const ModelControls: React.FC<ModelControlsProps> = ({
                                     {filteredProviders.map((provider, index) => (
                                         <React.Fragment key={provider.id}>
                                             {index > 0 && <DropdownMenuSeparator />}
-                                            <DropdownMenuLabel className="typography-micro font-semibold text-muted-foreground uppercase tracking-wider flex items-center gap-2 -mx-1 px-3 py-1.5 sticky top-0 z-10 bg-background border-b border-border/30">
+                                            <DropdownMenuLabel
+                                                style={{ backgroundColor: 'var(--surface-elevated)' }}
+                                                className="typography-micro font-semibold text-muted-foreground uppercase tracking-wider flex items-center gap-2 -mx-1 px-3 py-1.5 sticky top-0 z-10 border-b border-border/30"
+                                            >
                                                 <ProviderLogo
                                                     providerId={provider.id}
                                                     className="h-4 w-4 flex-shrink-0"
@@ -2148,7 +2198,7 @@ export const ModelControls: React.FC<ModelControlsProps> = ({
                         onTouchCancel={handleLongPressEnd}
                         className={cn(
                             'model-controls__model-trigger flex items-center gap-1.5 min-w-0 focus:outline-none',
-                            'cursor-pointer hover:opacity-70',
+                            'cursor-pointer hover:bg-transparent hover:opacity-70',
                             buttonHeight
                         )}
                     >
@@ -2317,7 +2367,7 @@ export const ModelControls: React.FC<ModelControlsProps> = ({
                     className={cn(
                         'model-controls__variant-trigger flex items-center gap-1.5 transition-opacity min-w-0 focus:outline-none',
                         buttonHeight,
-                        'cursor-pointer hover:opacity-70',
+                        'cursor-pointer hover:bg-transparent hover:opacity-70',
                     )}
                 >
                     <RiBrainAi3Line className={cn(controlIconSize, 'flex-shrink-0', colorClass)} />
@@ -2341,7 +2391,7 @@ export const ModelControls: React.FC<ModelControlsProps> = ({
                         <DropdownMenuTrigger asChild>
                             <div
                                 className={cn(
-                                    'model-controls__variant-trigger flex items-center gap-1.5 transition-opacity cursor-pointer hover:opacity-70 min-w-0',
+                                    'model-controls__variant-trigger flex items-center gap-1.5 transition-colors cursor-pointer hover:bg-transparent hover:opacity-70 min-w-0',
                                     buttonHeight,
                                 )}
                             >
@@ -2399,11 +2449,11 @@ export const ModelControls: React.FC<ModelControlsProps> = ({
             return (
                 <div className="flex items-center gap-2 min-w-0">
                     <Tooltip delayDuration={1000}>
-                        <DropdownMenu>
+                        <DropdownMenu open={isAgentSelectorOpen} onOpenChange={setIsAgentSelectorOpen}>
                             <TooltipTrigger asChild>
                                 <DropdownMenuTrigger asChild>
                                     <div className={cn(
-                                        'flex items-center gap-1.5 transition-opacity cursor-pointer hover:opacity-70 min-w-0',
+                                        'flex items-center gap-1.5 transition-colors cursor-pointer hover:bg-transparent hover:opacity-70 min-w-0',
                                         buttonHeight
                                     )}>
                                         <RiAiAgentLine
@@ -2428,29 +2478,66 @@ export const ModelControls: React.FC<ModelControlsProps> = ({
                                     </div>
                                 </DropdownMenuTrigger>
                             </TooltipTrigger>
-                            <DropdownMenuContent align="end" alignOffset={-40} className="w-[min(280px,calc(100vw-2rem))]">
-                                {agents.filter(agent => isPrimaryMode(agent.mode)).map((agent) => (
-                                    <DropdownMenuItem
-                                        key={agent.name}
-                                        className="typography-meta"
-                                        onSelect={() => handleAgentChange(agent.name)}
-                                    >
-                                        <div className="flex flex-col gap-0.5">
-                                            <div className="flex items-center gap-1.5">
-                                                <div className={cn(
-                                                    'h-1 w-1 rounded-full agent-dot',
-                                                    getAgentColor(agent.name).class
-                                                )} />
-                                                <span className="font-medium">{capitalizeAgentName(agent.name)}</span>
+                            <DropdownMenuContent align="end" alignOffset={-40} className="w-[min(280px,calc(100vw-2rem))] p-0 flex flex-col">
+                                <div className="p-2 border-b border-border/40">
+                                    <div className="relative">
+                                        <RiSearchLine className="absolute left-2.5 top-1/2 -translate-y-1/2 h-3.5 w-3.5 text-muted-foreground" />
+                                        <Input
+                                            type="text"
+                                            placeholder="Search agents"
+                                            value={agentSearchQuery}
+                                            onChange={(e) => setAgentSearchQuery(e.target.value)}
+                                            className="pl-8 h-8 typography-meta"
+                                            autoFocus
+                                        />
+                                    </div>
+                                </div>
+                                <ScrollableOverlay outerClassName="max-h-[min(400px,calc(100dvh-12rem))] flex-1">
+                                    <div className="p-1">
+                                        {!agentSearchQuery.trim() && defaultAgentName && (
+                                            <>
+                                                <DropdownMenuItem
+                                                    className="typography-meta"
+                                                    onSelect={() => handleAgentChange(defaultAgentName)}
+                                                >
+                                                    <div className="flex items-center gap-1.5">
+                                                        <RiArrowGoBackLine className="h-3.5 w-3.5 text-muted-foreground" />
+                                                        <span className="font-medium">Reset to default</span>
+                                                    </div>
+                                                </DropdownMenuItem>
+                                                <DropdownMenuSeparator />
+                                            </>
+                                        )}
+                                        {sortedAndFilteredAgents.length === 0 ? (
+                                            <div className="px-2 py-4 text-center typography-meta text-muted-foreground">
+                                                No agents found
                                             </div>
-                                            {agent.description && (
-                                                <span className="typography-meta text-muted-foreground max-w-[200px] ml-2.5 break-words">
-                                                    {agent.description}
-                                                </span>
-                                            )}
-                                        </div>
-                                    </DropdownMenuItem>
-                                ))}
+                                        ) : (
+                                            sortedAndFilteredAgents.map((agent) => (
+                                                <DropdownMenuItem
+                                                    key={agent.name}
+                                                    className="typography-meta"
+                                                    onSelect={() => handleAgentChange(agent.name)}
+                                                >
+                                                    <div className="flex flex-col gap-0.5">
+                                                        <div className="flex items-center gap-1.5">
+                                                            <div className={cn(
+                                                                'h-1 w-1 rounded-full agent-dot',
+                                                                getAgentColor(agent.name).class
+                                                            )} />
+                                                            <span className="font-medium">{capitalizeAgentName(agent.name)}</span>
+                                                        </div>
+                                                        {agent.description && (
+                                                            <span className="typography-meta text-muted-foreground max-w-[200px] ml-2.5 break-words">
+                                                                {agent.description}
+                                                            </span>
+                                                        )}
+                                                    </div>
+                                                </DropdownMenuItem>
+                                            ))
+                                        )}
+                                    </div>
+                                </ScrollableOverlay>
                                 <DropdownMenuSeparator />
                                 <div className="flex flex-col gap-1 px-1 py-0.5">
                                     <div className="rounded-xl bg-transparent">
@@ -2485,9 +2572,9 @@ export const ModelControls: React.FC<ModelControlsProps> = ({
                 onTouchEnd={handleLongPressEnd}
                 onTouchCancel={handleLongPressEnd}
                 className={cn(
-                    'model-controls__agent-trigger flex items-center gap-1.5 transition-opacity min-w-0 focus:outline-none',
+                    'model-controls__agent-trigger flex items-center gap-1.5 transition-colors min-w-0 focus:outline-none',
                     buttonHeight,
-                    'cursor-pointer hover:opacity-70',
+                    'cursor-pointer hover:bg-transparent hover:opacity-70',
                 )}
             >
                                         <RiAiAgentLine
