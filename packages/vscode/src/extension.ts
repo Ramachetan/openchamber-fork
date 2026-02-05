@@ -2,19 +2,65 @@ import * as vscode from 'vscode';
 import { ChatViewProvider } from './ChatViewProvider';
 import { AgentManagerPanelProvider } from './AgentManagerPanelProvider';
 import { SessionEditorPanelProvider } from './SessionEditorPanelProvider';
-import { createOpenCodeManager, type OpenCodeManager } from './opencode';
+import { UnifiedBackendManager } from './backends/backendManager';
+import type { BackendDebugInfo, BackendManager as BackendManagerInterface, BackendType, ConnectionStatus } from './backends/types';
+import { detectAvailableBackends, selectBackend } from './backends/detector';
+import type { OpenCodeManager } from './opencode';
 import { startGlobalEventWatcher, stopGlobalEventWatcher, setChatViewProvider } from './sessionActivityWatcher';
 
 let chatViewProvider: ChatViewProvider | undefined;
 let agentManagerProvider: AgentManagerPanelProvider | undefined;
 let sessionEditorProvider: SessionEditorPanelProvider | undefined;
-let openCodeManager: OpenCodeManager | undefined;
+let backendManager: UnifiedBackendManager | undefined;
 let outputChannel: vscode.OutputChannel | undefined;
+let backendStatusSubscription: vscode.Disposable | undefined;
 
 let activeSessionId: string | null = null;
 let activeSessionTitle: string | null = null;
 
 const SETTINGS_KEY = 'neusis-code.settings';
+
+const getDebugAdditionalInfo = (debug: BackendDebugInfo | undefined): Record<string, unknown> =>
+  debug?.additionalInfo ?? {};
+
+const getDebugAdditionalString = (debug: BackendDebugInfo | undefined, key: string): string | undefined => {
+  const value = getDebugAdditionalInfo(debug)[key];
+  return typeof value === 'string' ? value : undefined;
+};
+
+const getDebugAdditionalNumber = (debug: BackendDebugInfo | undefined, key: string): number | undefined => {
+  const value = getDebugAdditionalInfo(debug)[key];
+  return typeof value === 'number' && Number.isFinite(value) ? value : undefined;
+};
+
+interface BackendWithApiUrl {
+  getApiUrl: () => string | null;
+}
+
+interface BackendWithOpenCodeManager {
+  getOpenCodeManager: () => OpenCodeManager | null | undefined;
+}
+
+const hasApiUrlGetter = (backend: BackendManagerInterface): backend is BackendManagerInterface & BackendWithApiUrl => {
+  return 'getApiUrl' in backend && typeof (backend as BackendWithApiUrl).getApiUrl === 'function';
+};
+
+const hasOpenCodeManagerGetter = (
+  backend: BackendManagerInterface
+): backend is BackendManagerInterface & BackendWithOpenCodeManager => {
+  return 'getOpenCodeManager' in backend && typeof (backend as BackendWithOpenCodeManager).getOpenCodeManager === 'function';
+};
+
+const resolveBackendApiUrl = (backend: BackendManagerInterface | null | undefined): string | null => {
+  if (!backend) return null;
+  if (hasApiUrlGetter(backend)) {
+    return backend.getApiUrl();
+  }
+  if (hasOpenCodeManagerGetter(backend)) {
+    return backend.getOpenCodeManager()?.getApiUrl?.() ?? null;
+  }
+  return null;
+};
 
 const formatIso = (value: number | null | undefined) => {
   if (typeof value !== 'number' || !Number.isFinite(value)) return '(none)';
@@ -29,6 +75,12 @@ const formatDurationMs = (value: number | null | undefined) => {
   if (typeof value !== 'number' || !Number.isFinite(value)) return '(none)';
   const seconds = Math.round(value / 100) / 10;
   return `${seconds}s`;
+};
+
+const formatConnectedDuration = (debug: BackendDebugInfo | undefined) => {
+  const lastConnectedAt = getDebugAdditionalNumber(debug, 'lastConnectedAt');
+  if (lastConnectedAt === undefined) return '(n/a)';
+  return formatDurationMs(Date.now() - lastConnectedAt);
 };
 
 export async function activate(context: vscode.ExtensionContext) {
@@ -115,12 +167,16 @@ export async function activate(context: vscode.ExtensionContext) {
     await config.update('apiUrl', '', vscode.ConfigurationTarget.Global);
   }
 
-  // Create OpenCode manager first
-  openCodeManager = createOpenCodeManager(context);
+  // Create Unified Backend Manager first
+  backendManager = new UnifiedBackendManager(context, outputChannel);
+
+  // Initialize backend BEFORE creating view providers
+  // This ensures backend detection completes before UI tries to use it
+  await backendManager.initialize();
 
   // Create chat view provider with manager reference
-  // The webview will show a loading state until OpenCode is ready
-  chatViewProvider = new ChatViewProvider(context, context.extensionUri, openCodeManager);
+  // Backend is now initialized and ready
+  chatViewProvider = new ChatViewProvider(context, context.extensionUri, backendManager);
 
   context.subscriptions.push(
     vscode.window.registerWebviewViewProvider(
@@ -158,8 +214,53 @@ export async function activate(context: vscode.ExtensionContext) {
   void maybeMoveChatToRightSidebarOnStartup();
 
   // Create Agent Manager panel provider
-  agentManagerProvider = new AgentManagerPanelProvider(context, context.extensionUri, openCodeManager);
-  sessionEditorProvider = new SessionEditorPanelProvider(context, context.extensionUri, openCodeManager);
+  agentManagerProvider = new AgentManagerPanelProvider(context, context.extensionUri, backendManager);
+  sessionEditorProvider = new SessionEditorPanelProvider(context, context.extensionUri, backendManager);
+
+  const broadcastBackendStatus = (status: ConnectionStatus, error?: string) => {
+    chatViewProvider?.updateConnectionStatus(status, error);
+    agentManagerProvider?.updateConnectionStatus(status, error);
+    sessionEditorProvider?.updateConnectionStatus(status, error);
+
+    if (status === 'connected' && chatViewProvider && backendManager?.getBackendType() === 'opencode') {
+      const active = backendManager.getActiveBackend();
+      const openCodeManager = active && hasOpenCodeManagerGetter(active)
+        ? active.getOpenCodeManager?.()
+        : undefined;
+      if (openCodeManager) {
+        setChatViewProvider(chatViewProvider);
+        void startGlobalEventWatcher(openCodeManager, chatViewProvider);
+      }
+    } else if (status === 'disconnected' || status === 'error') {
+      stopGlobalEventWatcher();
+    }
+  };
+
+  const bindBackendStatusSubscription = () => {
+    backendStatusSubscription?.dispose();
+    backendStatusSubscription = undefined;
+
+    const active = backendManager?.getActiveBackend();
+    if (!active) return;
+
+    const unsubscribeStatus = active.onStatusChange((status) => {
+      broadcastBackendStatus(status, undefined);
+    });
+
+    const unsubscribeError = active.onError((error) => {
+      broadcastBackendStatus('error', error.message);
+    });
+
+    backendStatusSubscription = {
+      dispose: () => {
+        unsubscribeStatus();
+        unsubscribeError();
+      },
+    };
+
+    const currentStatus = active.getStatus();
+    broadcastBackendStatus(currentStatus, undefined);
+  };
 
   context.subscriptions.push(
     vscode.commands.registerCommand('neusis-code.openAgentManager', () => {
@@ -218,10 +319,10 @@ export async function activate(context: vscode.ExtensionContext) {
   context.subscriptions.push(
     vscode.commands.registerCommand('neusis-code.restartApi', async () => {
       try {
-        await openCodeManager?.restart();
-        vscode.window.showInformationMessage('Neusis Code: API connection restarted');
+        await backendManager?.restart();
+        vscode.window.showInformationMessage('Neusis Code: Backend restarted');
       } catch (e) {
-        vscode.window.showErrorMessage(`Neusis Code: Failed to restart API - ${e}`);
+        vscode.window.showErrorMessage(`Neusis Code: Failed to restart backend - ${e}`);
       }
     })
   );
@@ -337,6 +438,98 @@ export async function activate(context: vscode.ExtensionContext) {
   );
 
   context.subscriptions.push(
+    vscode.commands.registerCommand('neusis-code.getBackendState', () => {
+      const config = vscode.workspace.getConfiguration('neusis-code');
+      const configuredBackend = config.get<string>('backend', 'auto');
+      const detection = backendManager?.getDetectionResult();
+
+      return {
+        currentBackend: backendManager?.getBackendType() || 'unknown',
+        configuredBackend,
+        availableBackends: detection?.available || [],
+        recommendedBackend: detection?.recommended || null,
+      };
+    })
+  );
+
+  context.subscriptions.push(
+    vscode.commands.registerCommand('neusis-code.setBackendPreference', async (backend: 'auto' | BackendType) => {
+      if (backend !== 'auto' && backend !== 'opencode' && backend !== 'claude-cli') {
+        throw new Error(`Invalid backend preference: ${String(backend)}`);
+      }
+
+      const config = vscode.workspace.getConfiguration('neusis-code');
+
+      if (!backendManager) {
+        await config.update('backend', backend, vscode.ConfigurationTarget.Global);
+        return false;
+      }
+
+      const targetBackend = backend === 'auto'
+        ? await (async () => {
+            const detection = await detectAvailableBackends(config);
+            return selectBackend(detection, undefined);
+          })()
+        : backend;
+      const currentBackend = backendManager.getBackendType();
+      let effectiveBackend: BackendType | null = currentBackend;
+      let fallbackUsed = false;
+
+      if (currentBackend !== targetBackend) {
+        try {
+          await backendManager.switchBackend(targetBackend);
+          effectiveBackend = targetBackend;
+        } catch (error) {
+          const switchError = error instanceof Error ? error.message : String(error);
+          outputChannel?.appendLine(`[Neusis Code] Backend switch to ${targetBackend} failed: ${switchError}`);
+
+          // Reliability fallback: if explicit OpenCode switch fails, attempt auto-detection once.
+          if (targetBackend === 'opencode') {
+            const detection = await detectAvailableBackends(config);
+            const fallbackTarget = await selectBackend(detection, undefined);
+            outputChannel?.appendLine(`[Neusis Code] Fallback backend target after failed OpenCode switch: ${fallbackTarget}`);
+            if (fallbackTarget !== targetBackend || backend === 'auto') {
+              await backendManager.switchBackend(fallbackTarget);
+              effectiveBackend = fallbackTarget;
+              fallbackUsed = true;
+            } else {
+              throw error;
+            }
+          } else {
+            throw error;
+          }
+        }
+      } else {
+        effectiveBackend = currentBackend;
+      }
+
+      if (!effectiveBackend) {
+        effectiveBackend = backendManager.getBackendType();
+      }
+      if (!effectiveBackend) {
+        throw new Error('No active backend after backend switch');
+      }
+
+      let persistedPreference: 'auto' | BackendType = 'auto';
+      if (backend !== 'auto' && effectiveBackend === targetBackend) {
+        persistedPreference = backend;
+      }
+      await config.update('backend', persistedPreference, vscode.ConfigurationTarget.Global);
+
+      chatViewProvider?.refreshBackend();
+      agentManagerProvider?.refreshBackend();
+      sessionEditorProvider?.refreshBackend();
+      bindBackendStatusSubscription();
+
+      const switchMessage = fallbackUsed
+        ? `Neusis Code: Switched backend to ${effectiveBackend} (fallback from ${targetBackend}). Preference set to auto.`
+        : `Neusis Code: Switched backend to ${effectiveBackend}`;
+      vscode.window.showInformationMessage(switchMessage);
+      return true;
+    })
+  );
+
+  context.subscriptions.push(
     vscode.commands.registerCommand('neusis-code.showOpenCodeStatus', async () => {
       const config = vscode.workspace.getConfiguration('neusis-code');
       const configuredApiUrl = (config.get<string>('apiUrl') || '').trim();
@@ -345,9 +538,11 @@ export async function activate(context: vscode.ExtensionContext) {
       const workspaceFolders = (vscode.workspace.workspaceFolders || []).map((folder) => folder.uri.fsPath);
       const primaryWorkspace = workspaceFolders[0] || '';
 
-      const debug = openCodeManager?.getDebugInfo();
-      const resolvedApiUrl = openCodeManager?.getApiUrl();
-      const workingDirectory = openCodeManager?.getWorkingDirectory() ?? '';
+      const backend = backendManager?.getActiveBackend();
+      const debug = backend?.getDebugInfo();
+      const backendType = backendManager?.getBackendType();
+      const resolvedApiUrl = resolveBackendApiUrl(backend);
+      const workingDirectory = backend?.getWorkingDirectory() ?? '';
       const workingDirectoryMatchesWorkspace = Boolean(primaryWorkspace && workingDirectory === primaryWorkspace);
       let resolvedApiPath = '';
       if (resolvedApiUrl) {
@@ -447,49 +642,54 @@ export async function activate(context: vscode.ExtensionContext) {
       const lines = [
         `Time: ${new Date().toISOString()}`,
         `Neusis Code version: ${extensionVersion || '(unknown)'}`,
-        `OpenCode Version: ${debug?.version ?? '(unknown)'}`,
+        `Backend Type: ${backendType || '(unknown)'}`,
+        `Backend Version: ${debug?.version ?? '(unknown)'}`,
         `VS Code version: ${vscode.version}`,
         `Platform: ${process.platform} ${process.arch}`,
         `Workspace folders: ${workspaceFolders.length}${workspaceFolders.length ? ` (${workspaceFolders.join(', ')})` : ''}`,
-        `Status: ${openCodeManager?.getStatus() ?? 'unknown'}`,
+        `Status: ${backend?.getStatus() ?? 'unknown'}`,
         `Working directory: ${workingDirectory}`,
         `Working dir matches workspace: ${workingDirectoryMatchesWorkspace ? 'yes' : 'no'}`,
         `API URL (configured): ${configuredApiUrl || '(none)'}`,
-        `API URL (resolved): ${openCodeManager?.getApiUrl() ?? '(none)'}`,
+        `API URL (resolved): ${resolvedApiUrl ?? '(none)'}`,
         `API URL path: ${resolvedApiPath || '(none)'}`,
         debug
-          ? `OpenCode server URL: ${debug.serverUrl ?? '(none)'}`
-          : `OpenCode server URL: (unknown)`,
+          ? `Backend server URL: ${getDebugAdditionalString(debug, 'serverUrl') ?? '(none)'}`
+          : `Backend server URL: (unknown)`,
         debug
-          ? `OpenCode mode: ${debug.mode} (starts=${debug.startCount}, restarts=${debug.restartCount})`
-          : `OpenCode mode: (unknown)`,
+          ? `Backend mode: ${getDebugAdditionalString(debug, 'mode') ?? '(unknown)'} (starts=${getDebugAdditionalNumber(debug, 'startCount') ?? 0}, restarts=${getDebugAdditionalNumber(debug, 'restartCount') ?? 0})`
+          : `Backend mode: (unknown)`,
         debug
-          ? `OpenCode CLI path: ${debug.cliPath || '(not found - SDK manages process)'}`
-          : `OpenCode CLI path: (unknown)`,
+          ? `Backend CLI available: ${debug.cliAvailable ? 'yes' : 'no'}`
+          : `Backend CLI available: (unknown)`,
+        debug && backendType === 'opencode'
+          ? `OpenCode detected port: ${getDebugAdditionalNumber(debug, 'detectedPort') ?? '(none)'}`
+          : '',
+        debug && backendType === 'opencode'
+          ? `OpenCode API prefix: ${getDebugAdditionalInfo(debug).apiPrefixDetected === true ? (getDebugAdditionalString(debug, 'apiPrefix') || '(root)') : '(unknown)'}`
+          : '',
         debug
-          ? `OpenCode detected port: ${debug.detectedPort ?? '(none)'}`
-          : `OpenCode detected port: (unknown)`,
-        debug
-          ? `OpenCode API prefix: ${debug.apiPrefixDetected ? (debug.apiPrefix || '(root)') : '(unknown)'}`
-          : `OpenCode API prefix: (unknown)`,
-        debug
-          ? `Last start: ${formatIso(debug.lastStartAt)}`
+          ? `Last start: ${formatIso(getDebugAdditionalNumber(debug, 'lastStartAt'))}`
           : `Last start: (unknown)`,
+        debug && backendType === 'opencode'
+          ? `Last ready: ${getDebugAdditionalNumber(debug, 'lastReadyElapsedMs') !== undefined ? `${getDebugAdditionalNumber(debug, 'lastReadyElapsedMs')}ms` : '(unknown)'}`
+          : '',
+        debug && backendType === 'opencode'
+          ? `Ready attempts: ${getDebugAdditionalNumber(debug, 'lastReadyAttempts') ?? '(unknown)'}`
+          : '',
+        debug && backendType === 'opencode'
+          ? `Start attempts: ${getDebugAdditionalNumber(debug, 'lastStartAttempts') ?? '(unknown)'}`
+          : '',
         debug
-          ? `Last ready: ${debug.lastReadyElapsedMs !== null ? `${debug.lastReadyElapsedMs}ms` : '(unknown)'}`
-          : `Last ready: (unknown)`,
-        debug
-          ? `Ready attempts: ${debug.lastReadyAttempts ?? '(unknown)'}`
-          : `Ready attempts: (unknown)`,
-        debug
-          ? `Start attempts: ${debug.lastStartAttempts ?? '(unknown)'}`
-          : `Start attempts: (unknown)`,
-        debug
-          ? `Last connected: ${formatIso(debug.lastConnectedAt)}`
+          ? `Last connected: ${formatIso(getDebugAdditionalNumber(debug, 'lastConnectedAt'))}`
           : `Last connected: (unknown)`,
-        debug && debug.lastConnectedAt ? `Connected for: ${formatDurationMs(Date.now() - debug.lastConnectedAt)}` : `Connected for: (n/a)`,
-        debug && debug.lastExitCode !== null ? `Last exit code: ${debug.lastExitCode}` : `Last exit code: (none)`,
-        debug?.lastError ? `Last error: ${debug.lastError}` : `Last error: (none)`,
+        `Connected for: ${formatConnectedDuration(debug)}`,
+        debug && getDebugAdditionalNumber(debug, 'lastExitCode') !== undefined
+          ? `Last exit code: ${getDebugAdditionalNumber(debug, 'lastExitCode')}`
+          : `Last exit code: (none)`,
+        debug && getDebugAdditionalString(debug, 'lastError')
+          ? `Last error: ${getDebugAdditionalString(debug, 'lastError')}`
+          : `Last error: (none)`,
         `Settings keys (stored): ${settingsKeys.length ? settingsKeys.join(', ') : '(none)'}`,
         probes.length ? '' : '',
         ...(probes.length
@@ -536,33 +736,18 @@ export async function activate(context: vscode.ExtensionContext) {
     })
   );
 
-  // Subscribe to status changes - this broadcasts to webview
-  context.subscriptions.push(
-    openCodeManager.onStatusChange((status, error) => {
-      chatViewProvider?.updateConnectionStatus(status, error);
-      agentManagerProvider?.updateConnectionStatus(status, error);
-      sessionEditorProvider?.updateConnectionStatus(status, error);
+  bindBackendStatusSubscription();
 
-      // Start/stop global event watcher based on connection status
-      // Mirrors web server and desktop Tauri behavior
-      if (status === 'connected' && chatViewProvider && openCodeManager) {
-        setChatViewProvider(chatViewProvider);
-        void startGlobalEventWatcher(openCodeManager, chatViewProvider);
-      } else if (status === 'disconnected' || status === 'error') {
-        stopGlobalEventWatcher();
-      }
-    })
-  );
-
-  // Start OpenCode API without blocking activation.
-  // Blocking here delays webview resolution and causes a blank panel until startup completes.
-  void openCodeManager.start();
+  // Backend already initialized earlier (before creating view providers)
+  // This ensures proper backend detection and prevents "CLI not found" errors
 }
 
 export async function deactivate() {
+  backendStatusSubscription?.dispose();
+  backendStatusSubscription = undefined;
   stopGlobalEventWatcher();
-  await openCodeManager?.stop();
-  openCodeManager = undefined;
+  await backendManager?.dispose();
+  backendManager = undefined;
   chatViewProvider = undefined;
   agentManagerProvider = undefined;
   sessionEditorProvider = undefined;

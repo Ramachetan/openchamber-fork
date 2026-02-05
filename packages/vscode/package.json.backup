@@ -197,7 +197,7 @@
           "type": "string",
           "enum": ["auto", "opencode", "claude-cli"],
           "default": "auto",
-          "description": "Backend selection: 'auto' for auto-detection, 'opencode' for OpenCode API, 'claude-cli' for Claude Code"
+          "description": "Backend selection: 'auto' for auto-detection, 'opencode' for OpenCode API, 'claude-cli' for Claude CLI"
         },
         "neusis-code.apiUrl": {
           "type": "string",
@@ -207,7 +207,7 @@
         "neusis-code.claudeCli.wslEnabled": {
           "type": "boolean",
           "default": false,
-          "description": "Enable WSL integration for Claude Code on Windows"
+          "description": "Enable WSL integration for Claude CLI on Windows"
         },
         "neusis-code.claudeCli.wslDistro": {
           "type": "string",
@@ -245,12 +245,12 @@
     "@vitejs/plugin-react": "^5.0.0",
     "@vscode/vsce": "^3.2.1",
     "concurrently": "^9.2.1",
-    "esbuild": "^0.27.2",
+    "esbuild": "^0.24.2",
     "typescript": "~5.8.3",
     "vite": "^7.1.2"
   },
   "dependencies": {
-    "@openchamber/ui": "file:../ui",
+    "@openchamber/ui": "workspace:*",
     "@opencode-ai/sdk": "^1.1.48",
     "adm-zip": "^0.5.16",
     "jsonc-parser": "^3.3.1",

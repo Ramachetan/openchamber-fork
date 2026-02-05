@@ -562,6 +562,51 @@ export const useConfigStore = create<ConfigStore>()(
                                             }
                                         }
                                     }
+
+                                    const resolvedProviderId = typeof nextState.currentProviderId === "string"
+                                        ? nextState.currentProviderId
+                                        : state.currentProviderId;
+                                    const resolvedModelId = typeof nextState.currentModelId === "string"
+                                        ? nextState.currentModelId
+                                        : state.currentModelId;
+                                    const currentIsValid = processedProviders.some((provider) =>
+                                        provider.id === resolvedProviderId &&
+                                        provider.models.some((model) => model.id === resolvedModelId)
+                                    );
+
+                                    if (!currentIsValid) {
+                                        let fallbackProviderId = "";
+                                        let fallbackModelId = "";
+
+                                        for (const [providerId, modelId] of Object.entries(defaults)) {
+                                            const provider = processedProviders.find((item) => item.id === providerId);
+                                            if (provider?.models.some((model) => model.id === modelId)) {
+                                                fallbackProviderId = providerId;
+                                                fallbackModelId = modelId;
+                                                break;
+                                            }
+                                        }
+
+                                        if (!fallbackProviderId || !fallbackModelId) {
+                                            const firstProvider = processedProviders.find((provider) => provider.models.length > 0);
+                                            if (firstProvider) {
+                                                fallbackProviderId = firstProvider.id;
+                                                fallbackModelId = firstProvider.models[0]?.id || "";
+                                            }
+                                        }
+
+                                        if (fallbackProviderId && fallbackModelId) {
+                                            nextState.currentProviderId = fallbackProviderId;
+                                            nextState.currentModelId = fallbackModelId;
+                                            nextState.selectedProviderId = fallbackProviderId;
+                                            nextState.currentVariant = undefined;
+
+                                            nextSnapshot.currentProviderId = fallbackProviderId;
+                                            nextSnapshot.currentModelId = fallbackModelId;
+                                            nextSnapshot.selectedProviderId = fallbackProviderId;
+                                            nextSnapshot.currentVariant = undefined;
+                                        }
+                                    }
                                 }
 
                                 return nextState;

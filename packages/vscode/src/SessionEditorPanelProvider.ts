@@ -4,6 +4,8 @@ import { getThemeKindName } from './theme';
 import type { OpenCodeManager, ConnectionStatus } from './opencode';
 import { getWebviewShikiThemes } from './shikiThemes';
 import { getWebviewHtml } from './webviewHtml';
+import type { UnifiedBackendManager } from './backends/backendManager';
+import type { OpenCodeAdapter } from './backends/adapters/opencodeAdapter';
 
 type SessionPanelState = {
   panel: vscode.WebviewPanel;
@@ -18,12 +20,31 @@ export class SessionEditorPanelProvider {
   private _cachedError?: string;
   private _sseCounter = 0;
   private _panels = new Map<string, SessionPanelState>();
+  private _openCodeManager?: OpenCodeManager;
 
   constructor(
     private readonly _context: vscode.ExtensionContext,
     private readonly _extensionUri: vscode.Uri,
-    private readonly _openCodeManager?: OpenCodeManager
-  ) {}
+    private readonly _backendManager?: UnifiedBackendManager
+  ) {
+    this._refreshBackendBinding();
+  }
+
+  public refreshBackend(): void {
+    this._refreshBackendBinding();
+    for (const entry of this._panels.values()) {
+      this._sendCachedStateToPanel(entry);
+    }
+  }
+
+  private _refreshBackendBinding(): void {
+    if (this._backendManager?.getBackendType() === 'opencode') {
+      const backend = this._backendManager.getActiveBackend() as OpenCodeAdapter;
+      this._openCodeManager = backend?.getOpenCodeManager?.();
+      return;
+    }
+    this._openCodeManager = undefined;
+  }
 
   public createOrShowNewSession(): void {
     // Generate unique panel ID for new session drafts
@@ -105,6 +126,7 @@ export class SessionEditorPanelProvider {
       const response = await handleBridgeMessage(message, {
         manager: this._openCodeManager,
         context: this._context,
+        backendManager: this._backendManager,
       });
       state.panel.webview.postMessage(response);
     }, null, this._context.subscriptions);
@@ -136,6 +158,7 @@ export class SessionEditorPanelProvider {
       type: 'connectionStatus',
       status: this._cachedStatus,
       error: this._cachedError,
+      backendType: this._backendManager?.getBackendType() || 'unknown',
     });
   }
 
@@ -367,7 +390,8 @@ export class SessionEditorPanelProvider {
   private _getHtmlForWebview(webview: vscode.Webview, sessionId: string | null) {
     const workspaceFolder = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath || '';
     const initialStatus = this._cachedStatus;
-    const cliAvailable = this._openCodeManager?.isCliAvailable() ?? false;
+    const backendType = this._backendManager?.getBackendType() || 'unknown';
+    const cliAvailable = this._backendManager?.getActiveBackend()?.getDebugInfo().cliAvailable ?? true;
 
     return getWebviewHtml({
       webview,
@@ -375,6 +399,7 @@ export class SessionEditorPanelProvider {
       workspaceFolder,
       initialStatus,
       cliAvailable,
+      backendType,
       panelType: 'chat',
       initialSessionId: sessionId ?? undefined,
       viewMode: 'editor',

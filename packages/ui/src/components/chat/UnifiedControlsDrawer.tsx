@@ -39,6 +39,7 @@ interface UnifiedControlsDrawerProps {
     onOpenAgent: () => void;
     onOpenModel: () => void;
     onOpenEffort: () => void;
+    hideAgentControls?: boolean;
 }
 
 export const UnifiedControlsDrawer: React.FC<UnifiedControlsDrawerProps> = ({
@@ -47,6 +48,7 @@ export const UnifiedControlsDrawer: React.FC<UnifiedControlsDrawerProps> = ({
     onOpenAgent,
     onOpenModel,
     onOpenEffort,
+    hideAgentControls = false,
 }) => {
     const {
         providers,
@@ -209,49 +211,51 @@ export const UnifiedControlsDrawer: React.FC<UnifiedControlsDrawerProps> = ({
     return (
         <MobileOverlayPanel open={open} onClose={onClose} title="Controls">
             <div className="flex flex-col gap-3">
-                <div className="flex flex-col gap-2">
-                    <div className="typography-meta font-semibold uppercase tracking-wide text-muted-foreground">
-                        Agent
+                {!hideAgentControls && (
+                    <div className="flex flex-col gap-2">
+                        <div className="typography-meta font-semibold uppercase tracking-wide text-muted-foreground">
+                            Agent
+                        </div>
+                        <div className="rounded-xl border border-border/40 overflow-hidden">
+                            {agents.length === 0 ? (
+                                <div className="px-3 py-2 typography-meta text-muted-foreground">
+                                    No agents configured
+                                </div>
+                            ) : (
+                                quickAgentNames.map((agentName) => {
+                                    const displayName = getAgentDisplayName(agents, agentName);
+                                    const isSelected = agentName === uiAgentName;
+                                    return (
+                                        <button
+                                            key={agentName}
+                                            type="button"
+                                            onClick={() => handleAgentSelect(agentName)}
+                                            className={cn(
+                                                'flex min-h-[44px] w-full items-center border-b border-border/30 px-3 py-2 text-left last:border-b-0',
+                                                isSelected ? 'bg-primary/10' : ''
+                                            )}
+                                            aria-pressed={isSelected}
+                                        >
+                                            <span className="typography-meta font-medium text-foreground truncate">
+                                                {displayName}
+                                            </span>
+                                        </button>
+                                    );
+                                })
+                            )}
+                            {hasAgentOverflow && (
+                                <button
+                                    type="button"
+                                    onClick={onOpenAgent}
+                                    className="flex min-h-[44px] w-full items-center justify-center border-t border-border/30 px-3 py-2 typography-meta font-medium text-muted-foreground"
+                                    aria-label="More agents"
+                                >
+                                    ...
+                                </button>
+                            )}
+                        </div>
                     </div>
-                    <div className="rounded-xl border border-border/40 overflow-hidden">
-                        {agents.length === 0 ? (
-                            <div className="px-3 py-2 typography-meta text-muted-foreground">
-                                No agents configured
-                            </div>
-                        ) : (
-                            quickAgentNames.map((agentName) => {
-                                const displayName = getAgentDisplayName(agents, agentName);
-                                const isSelected = agentName === uiAgentName;
-                                return (
-                                    <button
-                                        key={agentName}
-                                        type="button"
-                                        onClick={() => handleAgentSelect(agentName)}
-                                        className={cn(
-                                            'flex min-h-[44px] w-full items-center border-b border-border/30 px-3 py-2 text-left last:border-b-0',
-                                            isSelected ? 'bg-primary/10' : ''
-                                        )}
-                                        aria-pressed={isSelected}
-                                    >
-                                        <span className="typography-meta font-medium text-foreground truncate">
-                                            {displayName}
-                                        </span>
-                                    </button>
-                                );
-                            })
-                        )}
-                        {hasAgentOverflow && (
-                            <button
-                                type="button"
-                                onClick={onOpenAgent}
-                                className="flex min-h-[44px] w-full items-center justify-center border-t border-border/30 px-3 py-2 typography-meta font-medium text-muted-foreground"
-                                aria-label="More agents"
-                            >
-                                ...
-                            </button>
-                        )}
-                    </div>
-                </div>
+                )}
 
                 <div className="flex flex-col gap-2">
                     <div className="typography-meta font-semibold uppercase tracking-wide text-muted-foreground">

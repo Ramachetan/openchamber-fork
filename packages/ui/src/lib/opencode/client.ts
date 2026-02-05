@@ -1,6 +1,6 @@
 import { createOpencodeClient, OpencodeClient } from "@opencode-ai/sdk/v2";
 import type { FilesAPI, RuntimeAPIs } from "../api/types";
-import { getDesktopHomeDirectory } from "../desktop";
+import { getDesktopHomeDirectory, isVSCodeRuntime } from "../desktop";
 import type {
   Session,
   Message,
@@ -244,6 +244,33 @@ class OpencodeService {
     return this.currentDirectory;
   }
 
+  private isClaudeCliBackendInVSCode(): boolean {
+    if (!isVSCodeRuntime() || typeof window === 'undefined') {
+      return false;
+    }
+    const backendType = (window as Window & {
+      __VSCODE_CONFIG__?: { backendType?: 'opencode' | 'claude-cli' | 'unknown' };
+    }).__VSCODE_CONFIG__?.backendType;
+    return backendType === 'claude-cli';
+  }
+
+  private async fetchClaudeJson<T>(url: string, init?: RequestInit): Promise<T> {
+    const response = await fetch(url, init);
+    if (!response.ok) {
+      throw new Error(`Claude endpoint failed: ${response.status} ${response.statusText}`);
+    }
+    const payload = await response.json().catch(() => null);
+    if (!payload || typeof payload !== 'object') {
+      throw new Error('Invalid Claude endpoint response');
+    }
+    const record = payload as { error?: unknown; success?: boolean; data?: unknown };
+    if (record.success === false) {
+      const errorMessage = typeof record.error === 'string' ? record.error : 'Claude request failed';
+      throw new Error(errorMessage);
+    }
+    return (record.data as T) ?? (payload as T);
+  }
+
   async withDirectory<T>(directory: string | undefined | null, fn: () => Promise<T>): Promise<T> {
     if (directory === undefined || directory === null) {
       return fn();
@@ -351,6 +378,9 @@ class OpencodeService {
 
   // Session Management
   async listSessions(): Promise<Session[]> {
+    if (this.isClaudeCliBackendInVSCode()) {
+      return this.fetchClaudeJson<Session[]>('/api/claude/session');
+    }
     const response = await this.client.session.list(
       this.currentDirectory ? { directory: this.currentDirectory } : undefined
     );
@@ -358,6 +388,19 @@ class OpencodeService {
   }
 
   async createSession(params?: { parentID?: string; title?: string }): Promise<Session> {
+    if (this.isClaudeCliBackendInVSCode()) {
+      const created = await this.fetchClaudeJson<Session>('/api/claude/session', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          parentID: params?.parentID,
+          title: params?.title,
+          directory: this.currentDirectory ?? null,
+        }),
+      });
+      if (!created) throw new Error('Failed to create session');
+      return created;
+    }
     const response = await this.client.session.create({
       ...(this.currentDirectory ? { directory: this.currentDirectory } : {}),
       parentID: params?.parentID,
@@ -368,6 +411,11 @@ class OpencodeService {
   }
 
   async getSession(id: string): Promise<Session> {
+    if (this.isClaudeCliBackendInVSCode()) {
+      const session = await this.fetchClaudeJson<Session>(`/api/claude/session?sessionId=${encodeURIComponent(id)}`);
+      if (!session) throw new Error('Session not found');
+      return session;
+    }
     const response = await this.client.session.get({
       sessionID: id,
       ...(this.currentDirectory ? { directory: this.currentDirectory } : {})
@@ -377,6 +425,14 @@ class OpencodeService {
   }
 
   async deleteSession(id: string): Promise<boolean> {
+    if (this.isClaudeCliBackendInVSCode()) {
+      const deleted = await this.fetchClaudeJson<boolean>('/api/claude/session', {
+        method: 'DELETE',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ sessionId: id }),
+      });
+      return Boolean(deleted);
+    }
     const response = await this.client.session.delete({
       sessionID: id,
       ...(this.currentDirectory ? { directory: this.currentDirectory } : {})
@@ -385,6 +441,15 @@ class OpencodeService {
   }
 
   async updateSession(id: string, title?: string): Promise<Session> {
+    if (this.isClaudeCliBackendInVSCode()) {
+      const updated = await this.fetchClaudeJson<Session>('/api/claude/session', {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ sessionId: id, title }),
+      });
+      if (!updated) throw new Error('Failed to update session');
+      return updated;
+    }
     const response = await this.client.session.update({
       sessionID: id,
       ...(this.currentDirectory ? { directory: this.currentDirectory } : {}),
@@ -395,6 +460,15 @@ class OpencodeService {
   }
 
   async getSessionMessages(id: string, limit?: number): Promise<{ info: Message; parts: Part[] }[]> {
+    if (this.isClaudeCliBackendInVSCode()) {
+      const suffix = typeof limit === 'number' && Number.isFinite(limit) && limit > 0
+        ? `?limit=${Math.floor(limit)}`
+        : '';
+      const data = await this.fetchClaudeJson<Array<{ info: Message; parts: Part[] }>>(
+        `/api/claude/session/${encodeURIComponent(id)}/messages${suffix}`
+      );
+      return Array.isArray(data) ? data : [];
+    }
     const response = await this.client.session.messages({
       sessionID: id,
       ...(this.currentDirectory ? { directory: this.currentDirectory } : {}),
@@ -741,6 +815,24 @@ class OpencodeService {
       throw new Error('Message must have at least one part (text or file)');
     }
 
+    if (this.isClaudeCliBackendInVSCode()) {
+      await this.fetchClaudeJson<{ ok: boolean }>(`/api/claude/session/${encodeURIComponent(params.id)}/prompt`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          providerID: params.providerID,
+          modelID: params.modelID,
+          mode: params.agent,
+          text: parts
+            .filter((part): part is TextPartInput => part.type === 'text' && typeof part.text === 'string')
+            .map((part) => part.text)
+            .join('\n\n')
+            .trim(),
+        }),
+      });
+      return tempMessageId;
+    }
+
     // Use SDK session.prompt() method
     // DON'T send messageID - let server generate it (fixes Claude empty response issue)
     await this.client.session.prompt({
@@ -762,6 +854,9 @@ class OpencodeService {
   }
 
   async abortSession(id: string): Promise<boolean> {
+    if (this.isClaudeCliBackendInVSCode()) {
+      return true;
+    }
     const response = await this.client.session.abort(
       {
         sessionID: id,
@@ -815,6 +910,10 @@ class OpencodeService {
   async getSessionStatusForDirectory(
     directory: string | null | undefined
   ): Promise<Record<string, { type: "idle" | "busy" | "retry"; attempt?: number; message?: string; next?: number }>> {
+    if (this.isClaudeCliBackendInVSCode()) {
+      const status = await this.fetchClaudeJson<Record<string, { type: "idle" | "busy" | "retry" }>>('/api/claude/session/status');
+      return status || {};
+    }
     try {
       const base = this.baseUrl.replace(/\/$/, "");
       const url = new URL(`${base}/session/status`);
@@ -1052,6 +1151,14 @@ class OpencodeService {
     providers: Provider[];
     default: { [key: string]: string };
   }> {
+    if (this.isClaudeCliBackendInVSCode()) {
+      const data = await this.fetchClaudeJson<{
+        providers: Provider[];
+        default: { [key: string]: string };
+      }>('/api/claude/providers');
+      if (!data) throw new Error('Failed to get providers');
+      return data;
+    }
     const response = await this.client.config.providers(
       this.currentDirectory ? { directory: this.currentDirectory } : undefined
     );
@@ -1080,6 +1187,10 @@ class OpencodeService {
 
   // Agent Management
   async listAgents(): Promise<Agent[]> {
+    if (this.isClaudeCliBackendInVSCode()) {
+      const data = await this.fetchClaudeJson<Agent[]>('/api/claude/agents');
+      return Array.isArray(data) ? data : [];
+    }
     try {
       const response = await this.client.app.agents(
         this.currentDirectory ? { directory: this.currentDirectory } : undefined
@@ -1327,6 +1438,19 @@ class OpencodeService {
     onOpen?: () => void,
     options?: { directory?: string | null }
   ): () => void {
+    if (this.isClaudeCliBackendInVSCode()) {
+      if (onOpen) {
+        setTimeout(() => {
+          try {
+            onOpen();
+          } catch {
+            // ignored
+          }
+        }, 0);
+      }
+      return () => {};
+    }
+
     const directoryFilter = this.normalizeCandidatePath(options?.directory ?? null);
     const listener = (event: RoutedOpencodeEvent) => {
       if (directoryFilter && event.directory !== directoryFilter) {

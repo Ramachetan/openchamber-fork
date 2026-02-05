@@ -2,9 +2,11 @@ import * as vscode from 'vscode';
 import * as os from 'os';
 import * as path from 'path';
 import * as fs from 'fs';
+import { randomUUID } from 'crypto';
 import { spawn, execFile } from 'child_process';
 import { promisify } from 'util';
 import { type OpenCodeManager } from './opencode';
+import type { UnifiedBackendManager } from './backends/backendManager';
 import { createAgent, createCommand, deleteAgent, deleteCommand, getAgentSources, getCommandSources, updateAgent, updateCommand, type AgentScope, type CommandScope, AGENT_SCOPE, COMMAND_SCOPE, discoverSkills, getSkillSources, createSkill, updateSkill, deleteSkill, readSkillSupportingFile, writeSkillSupportingFile, deleteSkillSupportingFile, type SkillScope, SKILL_SCOPE, getProviderSources, removeProviderConfig } from './opencodeConfig';
 import { getProviderAuth, removeProviderAuth } from './opencodeAuth';
 import { fetchQuotaForProvider, listConfiguredQuotaProviders } from './quotaProviders';
@@ -86,12 +88,288 @@ interface FileSearchResult {
 export interface BridgeContext {
   manager?: OpenCodeManager;
   context?: vscode.ExtensionContext;
+  backendManager?: UnifiedBackendManager;
 }
 
 const SETTINGS_KEY = 'openchamber.settings';
 const CLIENT_RELOAD_DELAY_MS = 800;
 const execFileAsync = promisify(execFile);
 const gpgconfCandidates = ['gpgconf', '/opt/homebrew/bin/gpgconf', '/usr/local/bin/gpgconf'];
+
+type ClaudeMessageRecord = {
+  info: {
+    id: string;
+    role: 'user' | 'assistant';
+    sessionID: string;
+    time: { created: number; updated: number };
+    providerID: string;
+    modelID: string;
+    mode?: string;
+    finish?: 'stop';
+  };
+  parts: Array<{ id: string; type: 'text'; text: string }>;
+};
+
+type ClaudeSessionRecord = {
+  id: string;
+  claudeSessionId: string;
+  title: string;
+  directory: string | null;
+  parentID?: string;
+  projectID: string;
+  version: string;
+  time: { created: number; updated: number };
+  summary?: unknown;
+  share?: unknown;
+  messages: ClaudeMessageRecord[];
+  status: { type: 'idle' | 'busy' | 'retry' };
+};
+
+const CLAUDE_PROVIDER_ID = 'claude-cli';
+const CLAUDE_MODELS: Array<{ id: string; name: string }> = [
+  { id: 'sonnet', name: 'Claude Sonnet' },
+  { id: 'opus', name: 'Claude Opus' },
+  { id: 'haiku', name: 'Claude Haiku' },
+];
+const CLAUDE_PROMPT_TIMEOUT_MS = 180000;
+const CLAUDE_SESSIONS_KEY = 'openchamber.claude.sessions.v1';
+const CLAUDE_MAX_PERSISTED_SESSIONS = 100;
+
+const claudeSessions = new Map<string, ClaudeSessionRecord>();
+let claudeSessionsLoadPromise: Promise<void> | null = null;
+
+const getCurrentBackendType = (ctx?: BridgeContext): 'opencode' | 'claude-cli' | 'unknown' => {
+  const type = ctx?.backendManager?.getBackendType();
+  if (type === 'opencode' || type === 'claude-cli') return type;
+  return 'unknown';
+};
+
+const ensureClaudeBackendActive = (ctx?: BridgeContext): string | null => {
+  const backendType = getCurrentBackendType(ctx);
+  if (backendType !== 'claude-cli') {
+    return 'Claude Code backend is not active';
+  }
+  return null;
+};
+
+const getCurrentWorkspaceDirectory = () => {
+  return vscode.workspace.workspaceFolders?.[0]?.uri.fsPath || os.homedir();
+};
+
+const parseClaudeTextOutput = (stdout: string): string => {
+  const trimmed = stdout.trim();
+  if (!trimmed) return '';
+
+  const lines = trimmed.split(/\r?\n/);
+  const textChunks: string[] = [];
+  for (const line of lines) {
+    const candidate = line.trim();
+    if (!candidate) continue;
+    if (!candidate.startsWith('{') || !candidate.endsWith('}')) {
+      textChunks.push(line);
+      continue;
+    }
+
+    try {
+      const parsed = JSON.parse(candidate) as Record<string, unknown>;
+      if (parsed.type === 'assistant') {
+        const message = parsed.message as Record<string, unknown> | undefined;
+        const content = Array.isArray(message?.content) ? message?.content : [];
+        for (const entry of content as Array<Record<string, unknown>>) {
+          if (entry.type === 'text' && typeof entry.text === 'string') {
+            textChunks.push(entry.text);
+          }
+        }
+      }
+      if (parsed.type === 'result') {
+        const maybeResult = parsed.result;
+        if (typeof maybeResult === 'string' && maybeResult.trim().length > 0) {
+          textChunks.push(maybeResult);
+        }
+      }
+    } catch {
+      textChunks.push(line);
+    }
+  }
+
+  return textChunks.join('\n').trim();
+};
+
+const runClaudePrompt = async (options: {
+  prompt: string;
+  workingDirectory: string;
+  sessionId: string;
+  model?: string;
+  timeoutMs?: number;
+}): Promise<string> => {
+  const args = [
+    '-p',
+    options.prompt,
+    '--output-format',
+    'text',
+    '--session-id',
+    options.sessionId,
+  ];
+
+  if (typeof options.model === 'string' && options.model.trim().length > 0) {
+    args.push('--model', options.model.trim());
+  }
+
+  return await new Promise<string>((resolve, reject) => {
+    const timeoutMs =
+      typeof options.timeoutMs === 'number' && Number.isFinite(options.timeoutMs) && options.timeoutMs > 0
+        ? Math.floor(options.timeoutMs)
+        : CLAUDE_PROMPT_TIMEOUT_MS;
+    const proc = spawn('claude', args, {
+      cwd: options.workingDirectory,
+      env: {
+        ...process.env,
+        FORCE_COLOR: '0',
+        NO_COLOR: '1',
+      },
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+
+    let stdout = '';
+    let stderr = '';
+    let timedOut = false;
+    let forceKillTimeout: ReturnType<typeof setTimeout> | undefined;
+    const timeoutHandle = setTimeout(() => {
+      timedOut = true;
+      proc.kill('SIGTERM');
+      forceKillTimeout = setTimeout(() => {
+        proc.kill('SIGKILL');
+      }, 2000);
+    }, timeoutMs);
+
+    proc.stdout?.on('data', (chunk) => {
+      stdout += chunk.toString();
+    });
+
+    proc.stderr?.on('data', (chunk) => {
+      stderr += chunk.toString();
+    });
+
+    proc.on('error', (error) => {
+      clearTimeout(timeoutHandle);
+      if (forceKillTimeout) clearTimeout(forceKillTimeout);
+      reject(error);
+    });
+
+    proc.on('close', (code) => {
+      clearTimeout(timeoutHandle);
+      if (forceKillTimeout) clearTimeout(forceKillTimeout);
+      const text = parseClaudeTextOutput(stdout);
+      if (timedOut) {
+        reject(new Error(`Claude Code request timed out after ${Math.round(timeoutMs / 1000)}s`));
+        return;
+      }
+      if (code === 0) {
+        resolve(text);
+        return;
+      }
+
+      const errorText = stderr.trim() || text || `Claude exited with code ${code ?? 'unknown'}`;
+      reject(new Error(errorText));
+    });
+  });
+};
+
+const isClaudeMessageRecord = (value: unknown): value is ClaudeMessageRecord => {
+  if (!value || typeof value !== 'object') return false;
+  const candidate = value as ClaudeMessageRecord;
+  return Boolean(
+    candidate.info?.id &&
+    candidate.info?.sessionID &&
+    (candidate.info?.role === 'user' || candidate.info?.role === 'assistant') &&
+    Array.isArray(candidate.parts)
+  );
+};
+
+const isClaudeSessionRecord = (value: unknown): value is ClaudeSessionRecord => {
+  if (!value || typeof value !== 'object') return false;
+  const candidate = value as ClaudeSessionRecord;
+  return Boolean(
+    typeof candidate.id === 'string' &&
+    typeof candidate.claudeSessionId === 'string' &&
+    typeof candidate.title === 'string' &&
+    typeof candidate.projectID === 'string' &&
+    typeof candidate.version === 'string' &&
+    candidate.time &&
+    typeof candidate.time.created === 'number' &&
+    typeof candidate.time.updated === 'number' &&
+    candidate.status &&
+    (candidate.status.type === 'idle' || candidate.status.type === 'busy' || candidate.status.type === 'retry') &&
+    Array.isArray(candidate.messages)
+  );
+};
+
+const cloneClaudeSessionForStorage = (session: ClaudeSessionRecord): ClaudeSessionRecord => ({
+  ...session,
+  messages: session.messages.slice(-500),
+});
+
+const persistClaudeSessions = async (context?: vscode.ExtensionContext): Promise<void> => {
+  if (!context) return;
+  const records = Array.from(claudeSessions.values())
+    .sort((a, b) => b.time.updated - a.time.updated)
+    .slice(0, CLAUDE_MAX_PERSISTED_SESSIONS)
+    .map(cloneClaudeSessionForStorage);
+  await context.globalState.update(CLAUDE_SESSIONS_KEY, records);
+};
+
+const ensureClaudeSessionsLoaded = async (context?: vscode.ExtensionContext): Promise<void> => {
+  if (!context) return;
+  if (!claudeSessionsLoadPromise) {
+    claudeSessionsLoadPromise = (async () => {
+      const stored = context.globalState.get<unknown[]>(CLAUDE_SESSIONS_KEY, []);
+      if (!Array.isArray(stored)) return;
+      claudeSessions.clear();
+      for (const candidate of stored) {
+        if (!isClaudeSessionRecord(candidate)) continue;
+        const sanitizedMessages = candidate.messages.filter(isClaudeMessageRecord);
+        claudeSessions.set(candidate.id, {
+          ...candidate,
+          messages: sanitizedMessages,
+        });
+      }
+    })();
+  }
+  await claudeSessionsLoadPromise;
+};
+
+const toClaudeSessionDto = (session: ClaudeSessionRecord) => ({
+  id: session.id,
+  title: session.title,
+  parentID: session.parentID,
+  directory: session.directory,
+  projectID: session.projectID,
+  version: session.version,
+  time: session.time,
+  summary: session.summary,
+  share: session.share,
+});
+
+const normalizeClaudeModelId = (candidate: unknown): string => {
+  if (typeof candidate !== 'string' || candidate.trim().length === 0) {
+    return 'sonnet';
+  }
+  const trimmed = candidate.trim();
+  const lower = trimmed.toLowerCase();
+  if (lower === 'sonnet' || lower === 'opus' || lower === 'haiku') {
+    return lower;
+  }
+  if (lower.includes('sonnet')) {
+    return trimmed;
+  }
+  if (lower.includes('opus')) {
+    return trimmed;
+  }
+  if (lower.includes('haiku')) {
+    return trimmed;
+  }
+  return 'sonnet';
+};
 
 const readSettings = (ctx?: BridgeContext) => {
   const stored = ctx?.context?.globalState.get<Record<string, unknown>>(SETTINGS_KEY) || {};
@@ -715,6 +993,7 @@ const collectHeaders = (headers: Headers): Record<string, string> => {
 
 export async function handleBridgeMessage(message: BridgeRequest, ctx?: BridgeContext): Promise<BridgeResponse> {
   const { id, type, payload } = message;
+  await ensureClaudeSessionsLoaded(ctx?.context);
 
   try {
     switch (type) {
@@ -781,6 +1060,254 @@ export async function handleBridgeMessage(message: BridgeRequest, ctx?: BridgeCo
           };
           return { id, type, success: true, data };
         }
+      }
+
+      case 'api:claude/providers': {
+        const backendError = ensureClaudeBackendActive(ctx);
+        if (backendError) {
+          return { id, type, success: false, error: backendError };
+        }
+
+        const models = CLAUDE_MODELS.reduce<Record<string, Record<string, unknown>>>((acc, model) => {
+          acc[model.id] = { id: model.id, name: model.name };
+          return acc;
+        }, {});
+
+        return {
+          id,
+          type,
+          success: true,
+          data: {
+            providers: [{ id: CLAUDE_PROVIDER_ID, name: 'Claude Code', models }],
+            default: { [CLAUDE_PROVIDER_ID]: CLAUDE_MODELS[0]?.id ?? 'sonnet' },
+          },
+        };
+      }
+
+      case 'api:claude/agents': {
+        const backendError = ensureClaudeBackendActive(ctx);
+        if (backendError) {
+          return { id, type, success: false, error: backendError };
+        }
+        return { id, type, success: true, data: [] };
+      }
+
+      case 'api:claude/session': {
+        const backendError = ensureClaudeBackendActive(ctx);
+        if (backendError) {
+          return { id, type, success: false, error: backendError };
+        }
+
+        const { method = 'GET', sessionId, title, parentID, directory } = (payload || {}) as {
+          method?: string;
+          sessionId?: string;
+          title?: string;
+          parentID?: string;
+          directory?: string | null;
+        };
+        const normalizedMethod = method.toUpperCase();
+
+        if (normalizedMethod === 'GET') {
+          if (typeof sessionId === 'string' && sessionId.length > 0) {
+            const session = claudeSessions.get(sessionId);
+            if (!session) {
+              return { id, type, success: false, error: 'Session not found' };
+            }
+            return { id, type, success: true, data: toClaudeSessionDto(session) };
+          }
+
+          const list = Array.from(claudeSessions.values())
+            .sort((a, b) => b.time.updated - a.time.updated)
+            .map(toClaudeSessionDto);
+          return { id, type, success: true, data: list };
+        }
+
+        if (normalizedMethod === 'POST') {
+          const now = Date.now();
+          const idValue = `claude_${randomUUID()}`;
+          const workspaceDirectory = typeof directory === 'string' && directory.trim().length > 0
+            ? directory.trim()
+            : getCurrentWorkspaceDirectory();
+          const resolvedTitle = typeof title === 'string' && title.trim().length > 0 ? title.trim() : 'New session';
+
+          const record: ClaudeSessionRecord = {
+            id: idValue,
+            claudeSessionId: randomUUID(),
+            title: resolvedTitle,
+            parentID: typeof parentID === 'string' && parentID.length > 0 ? parentID : undefined,
+            directory: workspaceDirectory,
+            projectID: workspaceDirectory,
+            version: 'claude-cli',
+            time: { created: now, updated: now },
+            messages: [],
+            status: { type: 'idle' },
+          };
+          claudeSessions.set(idValue, record);
+          await persistClaudeSessions(ctx?.context);
+          return { id, type, success: true, data: toClaudeSessionDto(record) };
+        }
+
+        if (normalizedMethod === 'PATCH') {
+          if (typeof sessionId !== 'string' || sessionId.length === 0) {
+            return { id, type, success: false, error: 'sessionId is required' };
+          }
+          const session = claudeSessions.get(sessionId);
+          if (!session) {
+            return { id, type, success: false, error: 'Session not found' };
+          }
+          if (typeof title === 'string' && title.trim().length > 0) {
+            session.title = title.trim();
+          }
+          session.time.updated = Date.now();
+          claudeSessions.set(session.id, session);
+          await persistClaudeSessions(ctx?.context);
+          return { id, type, success: true, data: toClaudeSessionDto(session) };
+        }
+
+        if (normalizedMethod === 'DELETE') {
+          if (typeof sessionId !== 'string' || sessionId.length === 0) {
+            return { id, type, success: false, error: 'sessionId is required' };
+          }
+          const removed = claudeSessions.delete(sessionId);
+          if (removed) {
+            await persistClaudeSessions(ctx?.context);
+          }
+          return { id, type, success: true, data: removed };
+        }
+
+        return { id, type, success: false, error: `Unsupported method: ${normalizedMethod}` };
+      }
+
+      case 'api:claude/session/messages': {
+        const backendError = ensureClaudeBackendActive(ctx);
+        if (backendError) {
+          return { id, type, success: false, error: backendError };
+        }
+        const { sessionId, limit } = (payload || {}) as { sessionId?: string; limit?: number };
+        if (typeof sessionId !== 'string' || sessionId.length === 0) {
+          return { id, type, success: false, error: 'sessionId is required' };
+        }
+        const session = claudeSessions.get(sessionId);
+        if (!session) {
+          return { id, type, success: false, error: 'Session not found' };
+        }
+        const items = typeof limit === 'number' && Number.isFinite(limit) && limit > 0
+          ? session.messages.slice(-Math.floor(limit))
+          : session.messages;
+        return { id, type, success: true, data: items };
+      }
+
+      case 'api:claude/session/prompt': {
+        const backendError = ensureClaudeBackendActive(ctx);
+        if (backendError) {
+          return { id, type, success: false, error: backendError };
+        }
+
+        const {
+          sessionId,
+          text,
+          providerID,
+          modelID,
+          mode,
+        } = (payload || {}) as {
+          sessionId?: string;
+          text?: string;
+          providerID?: string;
+          modelID?: string;
+          mode?: string;
+        };
+
+        if (typeof sessionId !== 'string' || sessionId.length === 0) {
+          return { id, type, success: false, error: 'sessionId is required' };
+        }
+        const session = claudeSessions.get(sessionId);
+        if (!session) {
+          return { id, type, success: false, error: 'Session not found' };
+        }
+        const prompt = typeof text === 'string' ? text.trim() : '';
+        if (!prompt) {
+          return { id, type, success: false, error: 'Prompt text is required' };
+        }
+        const normalizedModelId = normalizeClaudeModelId(modelID);
+
+        const now = Date.now();
+        session.status = { type: 'busy' };
+
+        const userMessageId = `msg_${randomUUID()}`;
+        const userMessage: ClaudeMessageRecord = {
+          info: {
+            id: userMessageId,
+            role: 'user',
+            sessionID: session.id,
+            time: { created: now, updated: now },
+            providerID: providerID || CLAUDE_PROVIDER_ID,
+            modelID: normalizedModelId,
+            mode: typeof mode === 'string' && mode.trim().length > 0 ? mode.trim() : undefined,
+            finish: 'stop',
+          },
+          parts: [{ id: `part_${randomUUID()}`, type: 'text', text: prompt }],
+        };
+        session.messages.push(userMessage);
+        await persistClaudeSessions(ctx?.context);
+
+        try {
+          const assistantText = await runClaudePrompt({
+            prompt,
+            sessionId: session.claudeSessionId,
+            workingDirectory: session.directory || getCurrentWorkspaceDirectory(),
+            model: normalizedModelId,
+            timeoutMs: CLAUDE_PROMPT_TIMEOUT_MS,
+          });
+
+          const completionAt = Date.now();
+          const assistantMessage: ClaudeMessageRecord = {
+            info: {
+              id: `msg_${randomUUID()}`,
+              role: 'assistant',
+              sessionID: session.id,
+              time: { created: completionAt, updated: completionAt },
+              providerID: providerID || CLAUDE_PROVIDER_ID,
+              modelID: normalizedModelId,
+              finish: 'stop',
+            },
+            parts: [
+              {
+                id: `part_${randomUUID()}`,
+                type: 'text',
+                text: assistantText || '(No response content)',
+              },
+            ],
+          };
+          session.messages.push(assistantMessage);
+          session.time.updated = completionAt;
+          session.status = { type: 'idle' };
+          claudeSessions.set(session.id, session);
+          await persistClaudeSessions(ctx?.context);
+          return { id, type, success: true, data: { ok: true } };
+        } catch (error) {
+          session.status = { type: 'idle' };
+          session.time.updated = Date.now();
+          claudeSessions.set(session.id, session);
+          await persistClaudeSessions(ctx?.context);
+          return {
+            id,
+            type,
+            success: false,
+            error: error instanceof Error ? error.message : 'Claude prompt failed',
+          };
+        }
+      }
+
+      case 'api:claude/session/status': {
+        const backendError = ensureClaudeBackendActive(ctx);
+        if (backendError) {
+          return { id, type, success: false, error: backendError };
+        }
+        const status = Array.from(claudeSessions.values()).reduce<Record<string, { type: 'idle' | 'busy' | 'retry' }>>((acc, session) => {
+          acc[session.id] = session.status;
+          return acc;
+        }, {});
+        return { id, type, success: true, data: status };
       }
 
       case 'files:list': {

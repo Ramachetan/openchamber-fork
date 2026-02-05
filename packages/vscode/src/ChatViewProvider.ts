@@ -4,11 +4,14 @@ import { getThemeKindName } from './theme';
 import type { OpenCodeManager, ConnectionStatus } from './opencode';
 import { getWebviewShikiThemes } from './shikiThemes';
 import { getWebviewHtml } from './webviewHtml';
+import type { UnifiedBackendManager } from './backends/backendManager';
+import type { OpenCodeAdapter } from './backends/adapters/opencodeAdapter';
 
 export class ChatViewProvider implements vscode.WebviewViewProvider {
   public static readonly viewType = 'neusis-code.chatView';
 
   private _view?: vscode.WebviewView;
+  private _openCodeManager?: OpenCodeManager;
 
   public isVisible() {
     return this._view?.visible ?? false;
@@ -24,8 +27,24 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
   constructor(
     private readonly _context: vscode.ExtensionContext,
     private readonly _extensionUri: vscode.Uri,
-    private readonly _openCodeManager?: OpenCodeManager
-  ) {}
+    private readonly _backendManager?: UnifiedBackendManager
+  ) {
+    this._refreshBackendBinding();
+  }
+
+  public refreshBackend(): void {
+    this._refreshBackendBinding();
+    this._sendCachedState();
+  }
+
+  private _refreshBackendBinding(): void {
+    if (this._backendManager?.getBackendType() === 'opencode') {
+      const backend = this._backendManager.getActiveBackend() as OpenCodeAdapter;
+      this._openCodeManager = backend?.getOpenCodeManager?.();
+      return;
+    }
+    this._openCodeManager = undefined;
+  }
 
   public resolveWebviewView(
     webviewView: vscode.WebviewView
@@ -67,6 +86,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       const response = await handleBridgeMessage(message, {
         manager: this._openCodeManager,
         context: this._context,
+        backendManager: this._backendManager,
       });
       webviewView.webview.postMessage(response);
     });
@@ -158,6 +178,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       type: 'connectionStatus',
       status: this._cachedStatus,
       error: this._cachedError,
+      backendType: this._backendManager?.getBackendType() || 'unknown',
     });
   }
 
@@ -376,7 +397,8 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
     const workspaceFolder = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath || '';
     // Use cached values which are updated by onStatusChange callback
     const initialStatus = this._cachedStatus;
-    const cliAvailable = this._openCodeManager?.isCliAvailable() ?? false;
+    const backendType = this._backendManager?.getBackendType() || 'unknown';
+    const cliAvailable = this._backendManager?.getActiveBackend()?.getDebugInfo().cliAvailable ?? true;
 
     return getWebviewHtml({
       webview,
@@ -384,6 +406,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
       workspaceFolder,
       initialStatus,
       cliAvailable,
+      backendType,
     });
   }
 }
